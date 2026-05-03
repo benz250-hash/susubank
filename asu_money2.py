@@ -1241,6 +1241,160 @@ def deepseek_decision_report(decision: Dict[str, Any]) -> str:
         return local_report(decision) + f"\n\n> DeepSeek 调用失败，已切换本地报告：{exc}"
 
 
+
+
+def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str, expected: float, due: str, memo: str = "") -> Dict[str, Any]:
+    """AI 贷款审批：本金仍是资产，但流动性弱，需要控制贷款资产占比。"""
+    tx = make_tx(
+        "放贷",
+        principal,
+        "家庭贷款",
+        party=borrower,
+        memo=memo,
+        expected_repayment=expected,
+        due_date=due,
+    )
+    sim = simulate_transaction(data, tx)
+    before, after, delta = sim["before"], sim["after"], sim["delta"]
+
+    rules = data.get("rules", {})
+    settings = data.get("settings", {})
+    floor = fnum(settings.get("cash_floor"))
+    soft = fnum(rules.get("loan_asset_soft_line"), fnum(settings.get("loan_asset_limit"), 0.45))
+    hard = fnum(rules.get("loan_asset_hard_line"), fnum(settings.get("hard_loan_asset_limit"), 0.65))
+    credit_reject = fnum(rules.get("credit_reject_line"), 650)
+
+    result = "通过"
+    reasons: List[str] = []
+
+    max_by_cash = max(0.0, before["cash"] - floor) if floor > 0 else max(0.0, before["cash"])
+    safe_capacity = max(0.0, soft * max(before["total_assets"], 1.0) - before["receivables"])
+    suggested = max(0.0, min(principal, max_by_cash, safe_capacity))
+
+    if principal <= 0:
+        result = "拒绝"
+        reasons.append("放贷本金必须大于 0。")
+
+    if after["cash"] < 0:
+        result = "拒绝"
+        reasons.append("放贷后现金余额为负，流动性不足。")
+
+    if after["total_assets"] > 0 and after["loan_asset_ratio"] > hard:
+        result = "拒绝"
+        reasons.append(f"放贷后应收贷款本金占总资产 {percent(after['loan_asset_ratio'])}，超过硬红线 {percent(hard)}。")
+
+    if after["credit_score"] is not None and after["credit_score"] < credit_reject:
+        result = "拒绝"
+        reasons.append(f"放贷后信用分低于 {credit_reject:.0f}。")
+
+    if result != "拒绝":
+        flags = []
+        if floor > 0 and after["cash"] < floor:
+            flags.append(f"放贷后现金低于安全线 {money(floor)}。")
+        if after["total_assets"] > 0 and after["loan_asset_ratio"] > soft:
+            flags.append(f"放贷后应收贷款本金占总资产 {percent(after['loan_asset_ratio'])}，超过建议线 {percent(soft)}。")
+        if principal > suggested and suggested > 0:
+            flags.append(f"建议最高放贷金额为 {money(suggested)}。")
+        if not due:
+            flags.append("没有填写预计还款日，回款纪律不足。")
+        if flags:
+            result = "限额通过"
+            reasons.extend(flags)
+
+    if result == "通过":
+        reasons.append("放贷后现金缓冲、贷款资产占比、信用分均未触发硬性风控限制。")
+
+    action = "可以放贷，但建议进入家长审批队列。"
+    if result == "拒绝":
+        action = "本次不建议放贷。先增加现金余额，或降低放贷金额。"
+    elif result == "限额通过":
+        action = f"建议限额放贷，最高不超过 {money(suggested)}；必须写清还款日。"
+
+    return {
+        "kind": "贷款审批",
+        "result": result,
+        "reasons": reasons,
+        "action": action,
+        "metrics": {
+            "拟借出本金": principal,
+            "借款人": borrower or "未填写",
+            "预计回款": expected,
+            "当前现金余额": before["cash"],
+            "放贷后现金余额": after["cash"],
+            "当前应收贷款本金": before["receivables"],
+            "放贷后应收贷款本金": after["receivables"],
+            "放贷后贷款资产占比": after["loan_asset_ratio"],
+            "当前信用分": before["credit_score"],
+            "放贷后信用分": after["credit_score"],
+            "信用分变化": delta["credit_score"],
+            "建议最高放贷金额": suggested,
+        },
+        "pending_tx": tx,
+        "simulation": sim,
+    }
+
+
+def build_risk_radar(data: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
+    """银行风险雷达：现金、收支、贷款、负债、预算、目标。"""
+    m = calc_financials(data)
+    risks = {"高风险": [], "中风险": [], "低风险": []}
+
+    if not has_activity(data):
+        risks["低风险"].append({"title": "账户为空", "detail": "暂无交易、预算、目标。请先建立收入、预算或信用分。"})
+        return risks
+
+    floor = fnum(data.get("settings", {}).get("cash_floor"))
+    if m["cash"] < 0:
+        risks["高风险"].append({"title": "现金余额为负", "detail": f"当前现金 {money(m['cash'])}，应暂停所有非必要消费。"})
+    elif floor > 0 and m["cash"] < floor:
+        risks["中风险"].append({"title": "现金缓冲偏低", "detail": f"当前现金 {money(m['cash'])}，低于安全线 {money(floor)}。"})
+    else:
+        risks["低风险"].append({"title": "现金余额未触发警报", "detail": f"当前现金 {money(m['cash'])}。"})
+
+    if m["month_income"] > 0:
+        if m["spend_income_ratio"] > 1.0:
+            risks["高风险"].append({"title": "本月支出超过收入", "detail": f"支出/收入比 {percent(m['spend_income_ratio'])}。"})
+        elif m["spend_income_ratio"] > 0.85:
+            risks["中风险"].append({"title": "本月支出接近收入上限", "detail": f"支出/收入比 {percent(m['spend_income_ratio'])}。"})
+        else:
+            risks["低风险"].append({"title": "支出收入比可控", "detail": f"支出/收入比 {percent(m['spend_income_ratio'])}。"})
+
+    if m["loan_asset_ratio"] > 0.60:
+        risks["高风险"].append({"title": "贷款资产占比过高", "detail": f"应收贷款本金占总资产 {percent(m['loan_asset_ratio'])}，流动性弱。"})
+    elif m["loan_asset_ratio"] > 0.45:
+        risks["中风险"].append({"title": "贷款资产占比偏高", "detail": f"应收贷款本金占总资产 {percent(m['loan_asset_ratio'])}，建议收回部分本金。"})
+    else:
+        risks["低风险"].append({"title": "贷款资产占比未触发警报", "detail": f"应收贷款本金占总资产 {percent(m['loan_asset_ratio'])}。"})
+
+    if m["liabilities"] > 0:
+        if m["debt_asset_ratio"] > 0.35:
+            risks["高风险"].append({"title": "负债偏高", "detail": f"负债占总资产 {percent(m['debt_asset_ratio'])}。"})
+        else:
+            risks["中风险"].append({"title": "存在未偿还负债", "detail": f"负债余额 {money(m['liabilities'])}。"})
+    else:
+        risks["低风险"].append({"title": "无未偿还负债", "detail": "净资产未被负债侵蚀。"})
+
+    for cat, row in m["budget_usage"].items():
+        if row["limit"] <= 0:
+            continue
+        if row["ratio"] > 1:
+            risks["高风险"].append({"title": f"{cat}预算超支", "detail": f"使用率 {percent(row['ratio'])}。"})
+        elif row["ratio"] > 0.85:
+            risks["中风险"].append({"title": f"{cat}预算接近上限", "detail": f"使用率 {percent(row['ratio'])}。"})
+
+    for g in m.get("goals", []):
+        if g.get("days_left") is not None and g["days_left"] <= 45 and g["progress"] < 0.6:
+            risks["中风险"].append({"title": f"储蓄目标进度落后：{g['name']}", "detail": f"剩余 {g['days_left']} 天，完成度 {percent(g['progress'])}。"})
+        elif g.get("progress", 0) >= 0.5:
+            risks["低风险"].append({"title": f"储蓄目标进度正常：{g['name']}", "detail": f"完成度 {percent(g['progress'])}。"})
+
+    if m.get("overdue_principal", 0) > 0:
+        risks["高风险"].append({"title": "存在逾期贷款", "detail": f"逾期本金 {money(m['overdue_principal'])}，暂停新增放贷。"})
+
+    return risks
+
+
+
 # ============================================================
 # 6. 运营逻辑：任务、愿望、复盘、报告
 # ============================================================
@@ -1794,26 +1948,89 @@ def page_parent(data: Dict[str, Any]) -> None:
 
 def page_approval_and_transactions(data: Dict[str, Any]) -> None:
     st.subheader("审批与交易")
-    tab1, tab2, tab3, tab4 = st.tabs(["AI 决策中心", "新增交易", "贷款审批", "交易流水"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["AI 决策中心", "消费审批", "贷款审批", "新增交易", "月度账单", "交易流水"])
+
     with tab1:
         text = st.text_area("输入请求", value="我想买 $18 的 Minecraft 道具")
         if st.button("AI 分类 + 风控审批", type="primary"):
             amounts = extract_amounts(text)
-            cls = ai_classify_purchase(text)
-            amount = amounts[0] if amounts else 0.0
-            decision = evaluate_purchase_decision(data, amount, cls["category"], text, cls["merchant"])
-            st.session_state["ai_cls"] = cls
+            is_loan = any(x in text for x in ["借给", "放贷", "贷款给"])
+            if is_loan:
+                principal = amounts[0] if amounts else 0.0
+                expected = amounts[1] if len(amounts) > 1 else principal
+                borrower = "未填写"
+                m = re.search(r"借给(.+?)(?:\$|[0-9]|，|,|。|$)", text or "")
+                if m:
+                    borrower = re.sub(r"\s+", "", m.group(1))[:12] or "未填写"
+                decision = evaluate_loan_decision(data, principal, borrower, expected, "", text)
+                st.session_state["ai_cls"] = {"category": "家庭贷款", "necessity": "金融行为", "impulse_level": "中", "merchant": borrower, "note": "贷款申请"}
+                st.session_state["ai_scenarios"] = []
+            else:
+                cls = ai_classify_purchase(text)
+                amount = amounts[0] if amounts else 0.0
+                decision = evaluate_purchase_decision(data, amount, cls["category"], text, cls["merchant"])
+                st.session_state["ai_cls"] = cls
+                st.session_state["ai_scenarios"] = scenario_planning(data, amount, cls["category"], text, cls["merchant"])
             st.session_state["ai_decision"] = decision
-            st.session_state["ai_scenarios"] = scenario_planning(data, amount, cls["category"], text, cls["merchant"])
+
         if "ai_cls" in st.session_state:
             st.markdown("#### AI 分类")
             st.dataframe(pd.DataFrame([st.session_state["ai_cls"]]), use_container_width=True, hide_index=True)
-        if "ai_scenarios" in st.session_state:
+        if st.session_state.get("ai_scenarios"):
             st.markdown("#### 情景规划")
             st.dataframe(pd.DataFrame(st.session_state["ai_scenarios"]), use_container_width=True, hide_index=True)
         if "ai_decision" in st.session_state:
             render_decision(st.session_state["ai_decision"], data, "ai_decision")
+
     with tab2:
+        st.markdown("#### 消费审批")
+        with st.form("purchase_form_bank"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                amount = st.number_input("购买金额", value=18.0, min_value=0.0, step=1.0, format="%.2f")
+            with c2:
+                category = st.selectbox("消费分类", spending_categories(data), key="purchase_category_bank")
+            with c3:
+                merchant = st.text_input("商户", "Minecraft 商店")
+            desc = st.text_area("购买说明", "Minecraft 道具")
+            submitted = st.form_submit_button("模拟消费审批", type="primary")
+        if submitted:
+            st.session_state["purchase_decision_bank"] = evaluate_purchase_decision(data, amount, category, desc, merchant)
+            st.session_state["purchase_scenarios_bank"] = scenario_planning(data, amount, category, desc, merchant)
+        if "purchase_scenarios_bank" in st.session_state:
+            st.markdown("#### 情景规划")
+            st.dataframe(pd.DataFrame(st.session_state["purchase_scenarios_bank"]), use_container_width=True, hide_index=True)
+        if "purchase_decision_bank" in st.session_state:
+            render_decision(st.session_state["purchase_decision_bank"], data, "purchase_bank")
+
+    with tab3:
+        st.markdown("#### 贷款审批")
+        with st.form("loan_form_bank"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                principal = st.number_input("拟借出本金", value=20.0, min_value=0.0, step=1.0, format="%.2f")
+            with c2:
+                borrower = st.text_input("借款人", "爸爸")
+            with c3:
+                expected = st.number_input("预计回款总额", value=22.0, min_value=0.0, step=1.0, format="%.2f")
+            due = st.date_input("预计还款日", value=date.today() + timedelta(days=7))
+            memo = st.text_area("备注", "家庭临时周转")
+            submitted = st.form_submit_button("模拟贷款审批", type="primary")
+        if submitted:
+            st.session_state["loan_decision_bank"] = evaluate_loan_decision(data, principal, borrower, expected, due.isoformat(), memo)
+        if "loan_decision_bank" in st.session_state:
+            render_decision(st.session_state["loan_decision_bank"], data, "loan_bank")
+
+        st.markdown("#### 贷款台账")
+        m = calc_financials(data)
+        loans = m.get("loans", [])
+        if not loans:
+            st.info("暂无应收贷款。")
+        else:
+            st.dataframe(pd.DataFrame(loans), use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.markdown("#### 新增交易")
         tx_type = st.selectbox("交易类型", ["收入", "消费", "转入储蓄", "储蓄取出", "放贷", "还款", "借入", "偿还负债"], index=0)
         with st.form("add_tx_form"):
             d = st.date_input("日期", value=date.today())
@@ -1837,14 +2054,36 @@ def page_approval_and_transactions(data: Dict[str, Any]) -> None:
             commit(data, event=f"新增交易：{tx_type}", reason=memo)
             st.success("交易已保存。")
             st.rerun()
-    with tab3:
-        st.info("贷款审批可在 AI 决策中心输入：借给爸爸 $20，预计一周后还 $22。")
-    with tab4:
+
+    with tab5:
+        st.markdown("#### 月度账单")
+        df = transactions_df(data)
+        if df.empty:
+            st.info("暂无交易。")
+        else:
+            months = sorted(df["日期"].astype(str).str[:7].unique(), reverse=True)
+            selected = st.selectbox("选择月份", months)
+            m = calc_financials(data, selected)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("本月收入", money(m["month_income"]))
+            c2.metric("本月消费", money(m["month_expense"]))
+            c3.metric("支出/收入比", percent(m["spend_income_ratio"]))
+            c4.metric("信用分", score_text(m["credit_score"]))
+            month_df = df[df["日期"].astype(str).str[:7] == selected].copy()
+            expense = month_df[month_df["类型"] == "消费"]
+            if not expense.empty:
+                by_cat = expense.groupby("分类")["金额"].sum().sort_values(ascending=False)
+                st.bar_chart(by_cat)
+            st.dataframe(month_df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
+
+    with tab6:
         df = transactions_df(data)
         if df.empty:
             st.info("暂无交易。")
         else:
             st.dataframe(df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
+            csv_text = df.drop(columns=["id"], errors="ignore").to_csv(index=False, encoding="utf-8-sig")
+            st.download_button("下载交易 CSV", csv_text.encode("utf-8-sig"), "asu_money2_transactions.csv", "text/csv")
 
 
 def transactions_df(data: Dict[str, Any]) -> pd.DataFrame:
@@ -1909,14 +2148,32 @@ def page_growth(data: Dict[str, Any]) -> None:
 
 def page_reports(data: Dict[str, Any]) -> None:
     st.subheader("报表与数据")
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["家庭金融仪表盘", "资产配置", "周报", "AI CFO 月报", "数据备份"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["银行风险雷达", "家庭金融仪表盘", "资产配置", "商户权益", "周报", "AI CFO 月报", "数据备份"])
+
     with tab1:
+        risks = build_risk_radar(data)
+        cols = st.columns(3)
+        for col, level in zip(cols, ["高风险", "中风险", "低风险"]):
+            with col:
+                st.markdown(f"### {level}")
+                if not risks[level]:
+                    st.info("暂无")
+                for item in risks[level]:
+                    css = "bad" if level == "高风险" else "warn" if level == "中风险" else "ok"
+                    st.markdown(f"<div class='decision {css}'><b>{item['title']}</b><p class='small'>{item['detail']}</p></div>", unsafe_allow_html=True)
+        st.divider()
+        st.markdown("#### 本周行动指令")
+        for i, a in enumerate(build_weekly_plan(data), 1):
+            st.write(f"**{i}.** {a}")
+
+    with tab2:
         a = behavior_analytics(data)
         st.dataframe(pd.DataFrame([a]), use_container_width=True, hide_index=True)
         st.markdown("#### 父母干预建议")
         for i, s in enumerate(parent_intervention_suggestions(data), 1):
             st.write(f"**{i}.** {s}")
-    with tab2:
+
+    with tab3:
         m = calc_financials(data)
         balances = m["balances"]
         total = sum(v for v in balances.values() if v > 0)
@@ -1927,7 +2184,21 @@ def page_reports(data: Dict[str, Any]) -> None:
             current = bal / total if total > 0 else 0
             rows.append({"账户": conf.get("name", k), "余额": money(bal), "当前比例": percent(current), "目标比例": percent(target), "偏离": percent(current - target)})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    with tab3:
+
+    with tab4:
+        st.markdown("#### 商户权益")
+        if not data.get("merchants"):
+            st.info("暂无商户权益。请到系统设置里新增商户。")
+        for merchant in data.get("merchants", []):
+            r = evaluate_merchant_access(data, merchant)
+            css = decision_class(r["result"])
+            failed = "无" if not r["failed"] else "；".join(r["failed"])
+            st.markdown(
+                f"<div class='decision {css}'><div class='pill'>{merchant.get('category')}</div><h3>{merchant.get('name')}</h3><p><b>{r['message']}</b></p><p class='small'>暂缓/失败原因：{failed}</p><p class='small'>{merchant.get('note','')}</p></div>",
+                unsafe_allow_html=True,
+            )
+
+    with tab5:
         if st.button("生成本周周报", type="primary"):
             report = generate_weekly_report(data)
             data.setdefault("weekly_reports", []).append(report)
@@ -1938,7 +2209,8 @@ def page_reports(data: Dict[str, Any]) -> None:
         for r in sorted(data.get("weekly_reports", []), key=lambda x: x.get("week_start", ""), reverse=True):
             with st.expander(f"{r.get('week_start')} 周报"):
                 st.text(r.get("content", ""))
-    with tab4:
+
+    with tab6:
         if st.button("生成 AI CFO 月报", type="primary"):
             report = generate_monthly_cfo_report(data)
             data.setdefault("monthly_cfo_reports", []).append(report)
@@ -1949,7 +2221,8 @@ def page_reports(data: Dict[str, Any]) -> None:
         for r in sorted(data.get("monthly_cfo_reports", []), key=lambda x: x.get("month", ""), reverse=True):
             with st.expander(f"{r.get('month')} 月报"):
                 st.text(r.get("content", ""))
-    with tab5:
+
+    with tab7:
         st.download_button("下载完整 JSON 备份", json.dumps(normalize_data(data), ensure_ascii=False, indent=2).encode("utf-8"), "asu_bank_backup.json", "application/json")
         if st.button("手动刷新 Google Sheet 展示页"):
             try:
@@ -1961,7 +2234,8 @@ def page_reports(data: Dict[str, Any]) -> None:
 
 def page_settings(data: Dict[str, Any]) -> None:
     st.subheader("系统设置")
-    tab1, tab2, tab3 = st.tabs(["账户设置", "风控规则", "商户与预算"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["账户设置", "风控规则", "预算管理", "储蓄目标", "商户权益配置"])
+
     with tab1:
         s = data.setdefault("settings", {})
         with st.form("settings_form"):
@@ -1972,10 +2246,15 @@ def page_settings(data: Dict[str, Any]) -> None:
             cash_floor = st.number_input("最低现金安全线", value=fnum(s.get("cash_floor")), step=1.0, format="%.2f")
             ok = st.form_submit_button("保存设置", type="primary", disabled=not is_admin())
         if ok:
-            s["owner"] = owner; s["start_cash"] = start_cash; s["start_savings"] = start_savings; s["base_score"] = int(base_score); s["cash_floor"] = cash_floor
+            s["owner"] = owner
+            s["start_cash"] = start_cash
+            s["start_savings"] = start_savings
+            s["base_score"] = int(base_score)
+            s["cash_floor"] = cash_floor
             commit(data, event="保存设置", reason="账户设置")
             st.success("已保存。")
             st.rerun()
+
     with tab2:
         rules = data.setdefault("rules", {})
         with st.form("rules_form"):
@@ -1986,15 +2265,19 @@ def page_settings(data: Dict[str, Any]) -> None:
         if ok:
             data["rules"] = new_rules
             data["settings"]["approval_threshold"] = fnum(new_rules.get("approval_threshold"), data["settings"].get("approval_threshold", 15))
+            data["settings"]["loan_asset_limit"] = fnum(new_rules.get("loan_asset_soft_line"), data["settings"].get("loan_asset_limit", 0.45))
+            data["settings"]["hard_loan_asset_limit"] = fnum(new_rules.get("loan_asset_hard_line"), data["settings"].get("hard_loan_asset_limit", 0.65))
             commit(data, event="保存风控规则", reason="规则更新")
             st.success("规则已保存。")
             st.rerun()
+
     with tab3:
-        st.markdown("#### 预算")
+        st.markdown("#### 预算管理")
         with st.form("budget_form"):
             new_budgets = {}
-            for cat, limit in data.get("budgets", {}).items():
-                new_budgets[cat] = st.number_input(f"{cat} 月度预算", value=fnum(limit), min_value=0.0, step=1.0, format="%.2f", key=f"budget_{cat}")
+            if data.get("budgets"):
+                for cat, limit in data.get("budgets", {}).items():
+                    new_budgets[cat] = st.number_input(f"{cat} 月度预算", value=fnum(limit), min_value=0.0, step=1.0, format="%.2f", key=f"budget_{cat}")
             new_cat = st.text_input("新增分类")
             new_limit = st.number_input("新增预算", min_value=0.0, step=1.0, format="%.2f")
             ok = st.form_submit_button("保存预算", disabled=not is_parent())
@@ -2004,6 +2287,59 @@ def page_settings(data: Dict[str, Any]) -> None:
             data["budgets"] = new_budgets
             commit(data, event="保存预算", reason="预算更新")
             st.success("预算已保存。")
+            st.rerun()
+        m = calc_financials(data)
+        rows = [{"分类": cat, "已花": money(row["spent"]), "预算": money(row["limit"]), "使用率": percent(row["ratio"])} for cat, row in m["budget_usage"].items()]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.markdown("#### 储蓄目标")
+        goals = calc_goals(data)
+        if not goals:
+            st.info("暂无储蓄目标。")
+        for g in goals:
+            st.markdown(f"**{g['name']}** · {money(g['current'])} / {money(g['target'])} · 完成度 {percent(g['progress'])}")
+            st.progress(min(1.0, g["progress"]))
+        with st.form("goal_form_bank"):
+            name = st.text_input("目标名称", "")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                target = st.number_input("目标金额", min_value=0.0, step=5.0, format="%.2f")
+            with c2:
+                current = st.number_input("当前金额", min_value=0.0, step=5.0, format="%.2f")
+            with c3:
+                category = st.selectbox("关联分类", spending_categories(data), key="goal_category_bank")
+            deadline = st.date_input("截止日", value=date.today() + timedelta(days=90))
+            ok = st.form_submit_button("新增目标", disabled=not is_parent())
+        if ok and name.strip():
+            data.setdefault("goals", []).append({"id": uid(), "name": name.strip(), "target": target, "current": current, "deadline": deadline.isoformat(), "category": category})
+            commit(data, event="新增储蓄目标", reason=name)
+            st.success("目标已新增。")
+            st.rerun()
+
+    with tab5:
+        st.markdown("#### 商户权益配置")
+        if not data.get("merchants"):
+            st.info("暂无商户。")
+        else:
+            st.dataframe(pd.DataFrame(data.get("merchants")), use_container_width=True, hide_index=True)
+        with st.form("merchant_form_bank"):
+            name = st.text_input("商户名称", "")
+            category = st.selectbox("商户分类", spending_categories(data), key="merchant_category_bank")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                required = st.number_input("最低信用分", min_value=0, max_value=850, value=0)
+            with c2:
+                discount = st.number_input("折扣比例", min_value=0.0, max_value=0.9, value=0.08, step=0.01)
+            with c3:
+                cap = st.number_input("品类预算开放上限", min_value=0.0, max_value=2.0, value=0.90, step=0.05)
+            note = st.text_input("说明", "")
+            ok = st.form_submit_button("新增商户", disabled=not is_parent())
+        if ok and name.strip():
+            data.setdefault("merchants", []).append({"id": uid(), "name": name.strip(), "category": category, "discount": discount, "required_score": int(required), "category_budget_cap": cap, "note": note})
+            commit(data, event="新增商户", reason=name)
+            st.success("商户已新增。")
             st.rerun()
 
 
