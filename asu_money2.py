@@ -234,6 +234,24 @@ def secret_value(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+
+def has_activity(data: Dict[str, Any]) -> bool:
+    """判断账户是否已经有真实活动。"""
+    s = data.get("settings", {})
+    return (
+        fnum(s.get("start_cash")) != 0
+        or fnum(s.get("start_savings")) != 0
+        or bool(data.get("transactions"))
+        or bool(data.get("budgets"))
+        or bool(data.get("goals"))
+        or bool(data.get("merchants"))
+        or bool(data.get("pending_requests"))
+        or bool(data.get("wishlist"))
+        or bool(data.get("tasks"))
+        or bool(data.get("post_purchase_reviews"))
+    )
+
+
 def category_options(data: Dict[str, Any]) -> List[str]:
     return sorted(set(list(data.get("budgets", {}).keys()) + ["零花钱", "家庭贷款", "游戏", "甜品", "学习", "宠物", "玩具", "餐饮", "其他"]))
 
