@@ -1110,7 +1110,7 @@ def deepseek_decision_report(decision: Dict[str, Any]) -> str:
             "https://api.deepseek.com/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
-                "model": "deepseek-chat",
+                "model": "deepseek-v4-pro",
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
