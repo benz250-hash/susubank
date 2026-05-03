@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 阿苏私人银行 2.0
-Google Sheet 云端存储优先，本地 JSON 兜底，空库启动。
+Google Sheet 主数据 + 可读报表页签版
 
-运行：
-    streamlit run asu_money2.py
-
-Google Sheet：
-    表格名由 Streamlit Secrets 的 SHEET_NAME 指定，例如 asu_bank。
-    worksheet 名称固定为 state。
-    A1=key, B1=value, A2=bank_data, B2=整套 JSON。
+存储设计：
+1. state 是唯一主数据源，A2/B2 存完整 JSON。
+2. transactions / budgets / goals / merchants / settings / summary 是自动生成的可读报表。
+3. 程序只读取 state，不读取展示页，避免手工改表造成数据错乱。
+4. Google Sheet 优先；失败时退回本地 asu_money2_data.json。
 """
 
 from __future__ import annotations
@@ -39,16 +37,55 @@ except Exception:
     Credentials = None
 
 APP_NAME = "阿苏私人银行 2.0"
-SCHEMA_VERSION = "asu-bank-gsheet-v1"
+SCHEMA_VERSION = "asu-bank-gsheet-readable-v1"
 DATA_PATH = Path("asu_money2_data.json")
-SESSION_KEY = "asu_bank_state_gsheet_v1"
+SESSION_KEY = "asu_bank_state_readable_v1"
 STATE_WORKSHEET = "state"
 STATE_KEY = "bank_data"
+
 GSHEET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
+REPORT_SHEETS = [
+    "summary",
+    "transactions",
+    "budgets",
+    "goals",
+    "merchants",
+    "settings",
+]
+
+
+# ============================================================
+# 1. 空库结构
+# ============================================================
+
+def empty_data() -> Dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "settings": {
+            "owner": "阿苏",
+            "currency": "USD",
+            "start_cash": 0.0,
+            "start_savings": 0.0,
+            "base_score": 0,
+            "cash_floor": 0.0,
+            "loan_asset_limit": 0.45,
+            "hard_loan_asset_limit": 0.65,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        "budgets": {},
+        "goals": [],
+        "merchants": [],
+        "transactions": [],
+    }
+
+
+# ============================================================
+# 2. 通用工具
+# ============================================================
 
 def uid() -> str:
     return str(uuid.uuid4())
@@ -99,25 +136,8 @@ def tx_month(tx: Dict[str, Any]) -> str:
     return str(tx.get("date", ""))[:7]
 
 
-def empty_data() -> Dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "settings": {
-            "owner": "阿苏",
-            "currency": "USD",
-            "start_cash": 0.0,
-            "start_savings": 0.0,
-            "base_score": 0,
-            "cash_floor": 0.0,
-            "loan_asset_limit": 0.45,
-            "hard_loan_asset_limit": 0.65,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        },
-        "budgets": {},
-        "goals": [],
-        "merchants": [],
-        "transactions": [],
-    }
+def score_text(score: Optional[int]) -> str:
+    return "未建立" if score is None else str(score)
 
 
 def has_activity(data: Dict[str, Any]) -> bool:
@@ -130,10 +150,6 @@ def has_activity(data: Dict[str, Any]) -> bool:
         or bool(data.get("goals"))
         or bool(data.get("merchants"))
     )
-
-
-def score_text(score: Optional[int]) -> str:
-    return "未建立" if score is None else str(score)
 
 
 def pretty_value(key: str, value: Any) -> str:
@@ -166,13 +182,20 @@ def spending_categories(data: Dict[str, Any]) -> List[str]:
     return cats if cats else ["其他"]
 
 
+# ============================================================
+# 3. 数据标准化
+# ============================================================
+
 def normalize_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         return empty_data()
+
     base = empty_data()
+
     settings = base["settings"]
-    if isinstance(raw.get("settings"), dict):
-        settings.update(raw["settings"])
+    incoming = raw.get("settings", {})
+    if isinstance(incoming, dict):
+        settings.update(incoming)
     settings["owner"] = settings.get("owner") or "阿苏"
     settings["currency"] = settings.get("currency") or "USD"
     settings["start_cash"] = fnum(settings.get("start_cash"))
@@ -183,64 +206,71 @@ def normalize_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     settings["hard_loan_asset_limit"] = fnum(settings.get("hard_loan_asset_limit"), 0.65)
     base["settings"] = settings
 
-    budgets = {}
+    budgets: Dict[str, float] = {}
     for k, v in (raw.get("budgets") or {}).items():
         name = str(k).strip()
         if name:
-            budgets[name] = fnum(v)
+            if isinstance(v, dict):
+                budgets[name] = fnum(v.get("limit"))
+            else:
+                budgets[name] = fnum(v)
     base["budgets"] = budgets
 
-    goals = []
+    goals: List[Dict[str, Any]] = []
     for g in raw.get("goals") or []:
-        if isinstance(g, dict):
-            goals.append({
-                "id": g.get("id") or uid(),
-                "name": g.get("name") or "未命名目标",
-                "target": fnum(g.get("target")),
-                "current": fnum(g.get("current")),
-                "deadline": g.get("deadline") or "",
-                "category": g.get("category") or "其他",
-            })
+        if not isinstance(g, dict):
+            continue
+        goals.append({
+            "id": g.get("id") or uid(),
+            "name": g.get("name") or "未命名目标",
+            "target": fnum(g.get("target")),
+            "current": fnum(g.get("current")),
+            "deadline": g.get("deadline") or "",
+            "category": g.get("category") or "其他",
+        })
     base["goals"] = goals
 
-    merchants = []
+    merchants: List[Dict[str, Any]] = []
     for m in raw.get("merchants") or []:
-        if isinstance(m, dict):
-            merchants.append({
-                "id": m.get("id") or uid(),
-                "name": m.get("name") or "未命名商户",
-                "category": m.get("category") or "其他",
-                "discount": fnum(m.get("discount")),
-                "required_score": inum(m.get("required_score"), 0),
-                "category_budget_cap": fnum(m.get("category_budget_cap"), 1.0),
-                "note": m.get("note") or "",
-            })
+        if not isinstance(m, dict):
+            continue
+        merchants.append({
+            "id": m.get("id") or uid(),
+            "name": m.get("name") or "未命名商户",
+            "category": m.get("category") or "其他",
+            "discount": fnum(m.get("discount")),
+            "required_score": inum(m.get("required_score"), 0),
+            "category_budget_cap": fnum(m.get("category_budget_cap"), 1.0),
+            "note": m.get("note") or "",
+        })
     base["merchants"] = merchants
 
-    transactions = []
+    transactions: List[Dict[str, Any]] = []
     for tx in raw.get("transactions") or []:
-        if isinstance(tx, dict):
-            transactions.append({
-                "id": tx.get("id") or uid(),
-                "date": tx.get("date") or today_str(),
-                "type": tx.get("type") or "消费",
-                "amount": fnum(tx.get("amount")),
-                "category": tx.get("category") or "其他",
-                "party": tx.get("party") or tx.get("counterparty") or "",
-                "memo": tx.get("memo") or "",
-                "expected_repayment": fnum(tx.get("expected_repayment")),
-                "principal_repaid": fnum(tx.get("principal_repaid")),
-                "interest_received": fnum(tx.get("interest_received")),
-                "due_date": tx.get("due_date") or "",
-            })
+        if not isinstance(tx, dict):
+            continue
+        transactions.append({
+            "id": tx.get("id") or uid(),
+            "date": tx.get("date") or today_str(),
+            "type": tx.get("type") or "消费",
+            "amount": fnum(tx.get("amount")),
+            "category": tx.get("category") or "其他",
+            "party": tx.get("party") or tx.get("counterparty") or "",
+            "memo": tx.get("memo") or "",
+            "expected_repayment": fnum(tx.get("expected_repayment")),
+            "principal_repaid": fnum(tx.get("principal_repaid")),
+            "interest_received": fnum(tx.get("interest_received")),
+            "due_date": tx.get("due_date") or "",
+        })
     base["transactions"] = transactions
+
     base["schema_version"] = SCHEMA_VERSION
     return base
 
 
-# -------------------------
-# Google Sheet and storage
-# -------------------------
+# ============================================================
+# 4. Google Sheet 存储层
+# ============================================================
 
 def gsheet_enabled() -> bool:
     if gspread is None or Credentials is None:
@@ -251,60 +281,88 @@ def gsheet_enabled() -> bool:
         return False
 
 
+def get_secret_value(key: str, default: str = "") -> str:
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+
 def get_gsheet_client():
     if not gsheet_enabled():
-        raise RuntimeError("Google Sheet 未配置或依赖未安装。")
+        raise RuntimeError("Google Sheet 未配置，或 gspread / google-auth 未安装。")
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=GSHEET_SCOPES)
     return gspread.authorize(creds)
 
 
-def get_state_worksheet():
+def get_spreadsheet():
     client = get_gsheet_client()
-    sheet_name = str(st.secrets["SHEET_NAME"])
-    spreadsheet = client.open(sheet_name)
+    return client.open(str(st.secrets["SHEET_NAME"]))
+
+
+def get_or_create_worksheet(spreadsheet, title: str, rows: int = 100, cols: int = 20):
     try:
-        worksheet = spreadsheet.worksheet(STATE_WORKSHEET)
+        return spreadsheet.worksheet(title)
     except Exception:
-        worksheet = spreadsheet.add_worksheet(title=STATE_WORKSHEET, rows=10, cols=2)
+        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def replace_worksheet(ws, rows: List[List[Any]]) -> None:
+    ws.clear()
+    if rows:
+        ws.update("A1", rows, value_input_option="RAW")
+
+
+def get_state_worksheet():
+    spreadsheet = get_spreadsheet()
+    ws = get_or_create_worksheet(spreadsheet, STATE_WORKSHEET, rows=10, cols=2)
     try:
-        header = worksheet.row_values(1)
+        header = ws.row_values(1)
         if header[:2] != ["key", "value"]:
-            worksheet.update("A1:B1", [["key", "value"]])
+            ws.update("A1:B1", [["key", "value"]], value_input_option="RAW")
     except Exception:
-        worksheet.update("A1:B1", [["key", "value"]])
-    return worksheet
+        ws.update("A1:B1", [["key", "value"]], value_input_option="RAW")
+    return ws
 
 
 def load_data_from_gsheet() -> Dict[str, Any]:
-    worksheet = get_state_worksheet()
-    rows = worksheet.get_all_records()
+    ws = get_state_worksheet()
+    rows = ws.get_all_records()
     for row in rows:
         if row.get("key") == STATE_KEY:
             raw_text = row.get("value") or ""
-            if not raw_text.strip():
+            if not str(raw_text).strip():
                 data = empty_data()
                 save_data_to_gsheet(data)
                 return data
             return normalize_data(json.loads(raw_text))
+
     data = empty_data()
     save_data_to_gsheet(data)
     return data
 
 
 def save_data_to_gsheet(data: Dict[str, Any]) -> None:
-    worksheet = get_state_worksheet()
-    json_text = json.dumps(normalize_data(data), ensure_ascii=False)
-    rows = worksheet.get_all_records()
+    data = normalize_data(data)
+    ws = get_state_worksheet()
+    json_text = json.dumps(data, ensure_ascii=False)
+
+    rows = ws.get_all_records()
     target_row = None
     for i, row in enumerate(rows, start=2):
         if row.get("key") == STATE_KEY:
             target_row = i
             break
+
     if target_row is None:
-        worksheet.append_row([STATE_KEY, json_text], value_input_option="RAW")
+        ws.append_row([STATE_KEY, json_text], value_input_option="RAW")
     else:
-        worksheet.update_cell(target_row, 2, json_text)
+        ws.update_cell(target_row, 2, json_text)
+
+    refresh_report_sheets(data)
 
 
 def save_data_local(data: Dict[str, Any]) -> None:
@@ -337,6 +395,7 @@ def load_data() -> Dict[str, Any]:
         except Exception as exc:
             st.session_state["storage_backend"] = f"本地 JSON 兜底：Google Sheet 读取失败：{exc}"
             return load_data_local()
+
     st.session_state["storage_backend"] = "本地 JSON"
     return load_data_local()
 
@@ -374,7 +433,133 @@ def reset_empty() -> None:
     save_data(data)
 
 
-def make_tx(tx_type: str, amount: float, category: str, party: str = "", memo: str = "", tx_date: Optional[str] = None, expected_repayment: float = 0.0, principal_repaid: float = 0.0, interest_received: float = 0.0, due_date: str = "") -> Dict[str, Any]:
+# ============================================================
+# 5. 报表页签展开
+# ============================================================
+
+def refresh_report_sheets(data: Dict[str, Any]) -> None:
+    """把主数据 state 展开成多个可读页签。程序不从这些页签读数据。"""
+    if not gsheet_enabled():
+        return
+
+    spreadsheet = get_spreadsheet()
+    data = normalize_data(data)
+    metrics = calc_financials(data)
+    ccy = metrics["currency"]
+
+    # summary
+    summary_rows = [
+        ["指标", "数值", "说明"],
+        ["总资产", metrics["total_assets"], "现金 + 储蓄 + 应收贷款本金"],
+        ["净资产", metrics["net_assets"], "总资产 - 负债"],
+        ["现金余额", metrics["cash"], "可立即使用资金"],
+        ["储蓄余额", metrics["savings"], "储蓄账户余额"],
+        ["应收贷款本金", metrics["receivables"], "已放出但未收回本金"],
+        ["负债余额", metrics["liabilities"], "未偿还借入资金"],
+        ["信用分", "未建立" if metrics["credit_score"] is None else metrics["credit_score"], "家庭内部风控评分"],
+        ["本月收入", metrics["month_income"], month_str()],
+        ["本月消费", metrics["month_expense"], month_str()],
+        ["本月支出收入比", metrics["spend_income_ratio"], "支出 / 收入"],
+        ["贷款资产占比", metrics["loan_asset_ratio"], "应收贷款本金 / 总资产"],
+        ["负债占比", metrics["debt_asset_ratio"], "负债 / 总资产"],
+        ["储蓄占比", metrics["savings_asset_ratio"], "储蓄 / 总资产"],
+        ["最后同步时间", datetime.now().isoformat(timespec="seconds"), "程序自动写入"],
+    ]
+    replace_worksheet(get_or_create_worksheet(spreadsheet, "summary", 50, 5), summary_rows)
+
+    # transactions
+    tx_rows = [["日期", "类型", "金额", "分类", "对象/商户", "本金回收", "利息收入", "预计回款", "到期日", "备注", "id"]]
+    for tx in sorted(data.get("transactions", []), key=lambda x: (str(x.get("date", "")), str(x.get("id", ""))), reverse=True):
+        tx_rows.append([
+            tx.get("date", ""),
+            tx.get("type", ""),
+            fnum(tx.get("amount")),
+            tx.get("category", ""),
+            tx.get("party", ""),
+            fnum(tx.get("principal_repaid")),
+            fnum(tx.get("interest_received")),
+            fnum(tx.get("expected_repayment")),
+            tx.get("due_date", ""),
+            tx.get("memo", ""),
+            tx.get("id", ""),
+        ])
+    replace_worksheet(get_or_create_worksheet(spreadsheet, "transactions", max(100, len(tx_rows) + 20), 12), tx_rows)
+
+    # budgets
+    budget_rows = [["分类", "月度预算", "本月已花", "使用率"]]
+    for cat, limit in sorted(data.get("budgets", {}).items()):
+        row = metrics["budget_usage"].get(cat, {"spent": 0.0, "ratio": 0.0})
+        budget_rows.append([cat, fnum(limit), row["spent"], row["ratio"]])
+    replace_worksheet(get_or_create_worksheet(spreadsheet, "budgets", max(30, len(budget_rows) + 10), 6), budget_rows)
+
+    # goals
+    goal_rows = [["目标", "分类", "目标金额", "当前金额", "剩余金额", "完成度", "截止日", "剩余天数", "id"]]
+    for g in metrics["goals"]:
+        goal_rows.append([
+            g.get("name", ""),
+            g.get("category", ""),
+            fnum(g.get("target")),
+            fnum(g.get("current")),
+            fnum(g.get("remaining")),
+            fnum(g.get("progress")),
+            g.get("deadline", ""),
+            "" if g.get("days_left") is None else g.get("days_left"),
+            g.get("id", ""),
+        ])
+    replace_worksheet(get_or_create_worksheet(spreadsheet, "goals", max(30, len(goal_rows) + 10), 10), goal_rows)
+
+    # merchants
+    merchant_rows = [["商户", "分类", "折扣", "最低信用分", "品类预算开放上限", "当前状态", "失败条件", "说明", "id"]]
+    for m in data.get("merchants", []):
+        access = evaluate_merchant_access(data, m)
+        merchant_rows.append([
+            m.get("name", ""),
+            m.get("category", ""),
+            fnum(m.get("discount")),
+            inum(m.get("required_score")),
+            fnum(m.get("category_budget_cap")),
+            access["result"],
+            "；".join(access["failed"]),
+            m.get("note", ""),
+            m.get("id", ""),
+        ])
+    replace_worksheet(get_or_create_worksheet(spreadsheet, "merchants", max(30, len(merchant_rows) + 10), 10), merchant_rows)
+
+    # settings
+    s = data.get("settings", {})
+    settings_rows = [["字段", "值", "说明"]]
+    labels = {
+        "owner": "账户名称",
+        "currency": "币种",
+        "start_cash": "初始现金",
+        "start_savings": "初始储蓄",
+        "base_score": "基础信用分，0 表示未建立",
+        "cash_floor": "最低现金安全线",
+        "loan_asset_limit": "贷款资产建议上限",
+        "hard_loan_asset_limit": "贷款资产硬红线",
+        "created_at": "账户创建时间",
+    }
+    for key in ["owner", "currency", "start_cash", "start_savings", "base_score", "cash_floor", "loan_asset_limit", "hard_loan_asset_limit", "created_at"]:
+        settings_rows.append([key, s.get(key, ""), labels.get(key, "")])
+    replace_worksheet(get_or_create_worksheet(spreadsheet, "settings", 30, 5), settings_rows)
+
+
+# ============================================================
+# 6. 交易对象与账务引擎
+# ============================================================
+
+def make_tx(
+    tx_type: str,
+    amount: float,
+    category: str,
+    party: str = "",
+    memo: str = "",
+    tx_date: Optional[str] = None,
+    expected_repayment: float = 0.0,
+    principal_repaid: float = 0.0,
+    interest_received: float = 0.0,
+    due_date: str = "",
+) -> Dict[str, Any]:
     return {
         "id": uid(),
         "date": tx_date or today_str(),
@@ -390,13 +575,11 @@ def make_tx(tx_type: str, amount: float, category: str, party: str = "", memo: s
     }
 
 
-# -------------------------
-# Financial engine
-# -------------------------
-
 def build_loan_book(transactions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     loans: List[Dict[str, Any]] = []
-    for tx in sorted(transactions, key=lambda x: (str(x.get("date", "")), str(x.get("id", "")))):
+    sorted_txs = sorted(transactions, key=lambda x: (str(x.get("date", "")), str(x.get("id", ""))))
+
+    for tx in sorted_txs:
         typ = tx.get("type")
         if typ == "放贷":
             principal = fnum(tx.get("amount"))
@@ -418,9 +601,11 @@ def build_loan_book(transactions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             principal_repaid = fnum(tx.get("principal_repaid"))
             if principal_repaid <= 0:
                 principal_repaid = fnum(tx.get("amount"))
+
             candidates = [loan for loan in loans if loan["remaining"] > 0 and (not borrower or loan["borrower"] == borrower)]
             if not candidates:
                 candidates = [loan for loan in loans if loan["remaining"] > 0]
+
             for loan in candidates:
                 if principal_repaid <= 0:
                     break
@@ -428,17 +613,26 @@ def build_loan_book(transactions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 loan["remaining"] -= applied
                 loan["repaid"] += applied
                 principal_repaid -= applied
+
     return loans
 
 
 def calc_budget_usage(data: Dict[str, Any], month: Optional[str] = None) -> Dict[str, Dict[str, float]]:
     month = month or month_str()
-    usage = {cat: {"limit": fnum(limit), "spent": 0.0, "ratio": 0.0} for cat, limit in data.get("budgets", {}).items()}
+    usage: Dict[str, Dict[str, float]] = {
+        cat: {"limit": fnum(limit), "spent": 0.0, "ratio": 0.0}
+        for cat, limit in data.get("budgets", {}).items()
+    }
+
     for tx in data.get("transactions", []):
-        if tx.get("type") == "消费" and tx_month(tx) == month:
-            cat = tx.get("category") or "其他"
-            usage.setdefault(cat, {"limit": 0.0, "spent": 0.0, "ratio": 0.0})
-            usage[cat]["spent"] += fnum(tx.get("amount"))
+        if tx.get("type") != "消费":
+            continue
+        if tx_month(tx) != month:
+            continue
+        cat = tx.get("category") or "其他"
+        usage.setdefault(cat, {"limit": 0.0, "spent": 0.0, "ratio": 0.0})
+        usage[cat]["spent"] += fnum(tx.get("amount"))
+
     for row in usage.values():
         row["ratio"] = row["spent"] / row["limit"] if row["limit"] > 0 else 0.0
     return usage
@@ -461,7 +655,18 @@ def calc_goal_status(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def calc_credit_score(data: Dict[str, Any], cash: float, savings: float, receivables: float, liabilities: float, total_assets: float, month_income: float, month_expense: float, budget_usage: Dict[str, Dict[str, float]], overdue_principal: float) -> Tuple[Optional[int], List[str]]:
+def calc_credit_score(
+    data: Dict[str, Any],
+    cash: float,
+    savings: float,
+    receivables: float,
+    liabilities: float,
+    total_assets: float,
+    month_income: float,
+    month_expense: float,
+    budget_usage: Dict[str, Dict[str, float]],
+    overdue_principal: float,
+) -> Tuple[Optional[int], List[str]]:
     settings = data.get("settings", {})
     base_score = inum(settings.get("base_score"), 0)
     if base_score <= 0:
@@ -470,6 +675,7 @@ def calc_credit_score(data: Dict[str, Any], cash: float, savings: float, receiva
     score = float(base_score)
     factors: List[str] = []
     cash_floor = fnum(settings.get("cash_floor"))
+
     if cash_floor > 0:
         if cash < 0:
             score -= 45
@@ -599,27 +805,34 @@ def calc_financials(data: Dict[str, Any], month: Optional[str] = None) -> Dict[s
     liabilities = max(0.0, liabilities)
     loans = build_loan_book(data.get("transactions", []))
     receivables = sum(fnum(loan.get("remaining")) for loan in loans)
+
     overdue_principal = 0.0
     today = date.today()
     for loan in loans:
         due = loan.get("due_date") or ""
         remaining = fnum(loan.get("remaining"))
-        if remaining > 0 and due:
-            try:
-                if date.fromisoformat(due) < today:
-                    overdue_principal += remaining
-            except Exception:
-                pass
+        if remaining <= 0 or not due:
+            continue
+        try:
+            if date.fromisoformat(due) < today:
+                overdue_principal += remaining
+        except Exception:
+            pass
 
     total_assets = cash + savings + receivables
     net_assets = total_assets - liabilities
     budget_usage = calc_budget_usage(data, month)
     goals = calc_goal_status(data)
-    credit_score, score_factors = calc_credit_score(data, cash, savings, receivables, liabilities, total_assets, month_income, month_expense, budget_usage, overdue_principal)
+    credit_score, score_factors = calc_credit_score(
+        data, cash, savings, receivables, liabilities, total_assets,
+        month_income, month_expense, budget_usage, overdue_principal
+    )
+
     spend_income_ratio = month_expense / month_income if month_income > 0 else (1.0 if month_expense > 0 else 0.0)
     loan_asset_ratio = receivables / total_assets if total_assets > 0 else 0.0
     debt_asset_ratio = liabilities / total_assets if total_assets > 0 else 0.0
     savings_asset_ratio = savings / total_assets if total_assets > 0 else 0.0
+
     return {
         "currency": currency,
         "cash": cash,
@@ -645,19 +858,30 @@ def calc_financials(data: Dict[str, Any], month: Optional[str] = None) -> Dict[s
     }
 
 
-# -------------------------
-# Decision engine
-# -------------------------
+# ============================================================
+# 7. 审批、风险、AI
+# ============================================================
 
 def simulate_transaction(data: Dict[str, Any], tx: Dict[str, Any]) -> Dict[str, Any]:
     before = calc_financials(data)
     after_data = copy.deepcopy(data)
     after_data.setdefault("transactions", []).append(tx)
     after = calc_financials(after_data)
-    before_score = before["credit_score"]
-    after_score = after["credit_score"]
-    score_delta = None if before_score is None or after_score is None else after_score - before_score
-    return {"before": before, "after": after, "delta": {"cash": after["cash"] - before["cash"], "savings": after["savings"] - before["savings"], "receivables": after["receivables"] - before["receivables"], "liabilities": after["liabilities"] - before["liabilities"], "total_assets": after["total_assets"] - before["total_assets"], "net_assets": after["net_assets"] - before["net_assets"], "credit_score": score_delta}, "tx": tx}
+    score_delta = None if before["credit_score"] is None or after["credit_score"] is None else after["credit_score"] - before["credit_score"]
+    return {
+        "before": before,
+        "after": after,
+        "delta": {
+            "cash": after["cash"] - before["cash"],
+            "savings": after["savings"] - before["savings"],
+            "receivables": after["receivables"] - before["receivables"],
+            "liabilities": after["liabilities"] - before["liabilities"],
+            "total_assets": after["total_assets"] - before["total_assets"],
+            "net_assets": after["net_assets"] - before["net_assets"],
+            "credit_score": score_delta,
+        },
+        "tx": tx,
+    }
 
 
 def usage_for(metrics: Dict[str, Any], category: str) -> Dict[str, float]:
@@ -665,13 +889,14 @@ def usage_for(metrics: Dict[str, Any], category: str) -> Dict[str, float]:
 
 
 def evaluate_purchase_decision(data: Dict[str, Any], amount: float, category: str, description: str, merchant: str = "") -> Dict[str, Any]:
-    tx = make_tx("消费", amount, category, merchant, description)
+    tx = make_tx("消费", amount, category, party=merchant, memo=description)
     sim = simulate_transaction(data, tx)
     before, after, delta = sim["before"], sim["after"], sim["delta"]
     budget = usage_for(after, category)
     cash_floor = fnum(data.get("settings", {}).get("cash_floor"))
     result = "批准"
     reasons: List[str] = []
+
     if amount <= 0:
         result = "拒绝"
         reasons.append("购买金额必须大于 0。")
@@ -684,6 +909,7 @@ def evaluate_purchase_decision(data: Dict[str, Any], amount: float, category: st
     if after["credit_score"] is not None and after["credit_score"] < 650:
         result = "拒绝"
         reasons.append("交易后信用分低于 650，进入高风险区。")
+
     if result != "拒绝":
         flags = []
         if cash_floor > 0 and after["cash"] < cash_floor:
@@ -697,18 +923,36 @@ def evaluate_purchase_decision(data: Dict[str, Any], amount: float, category: st
         if flags:
             result = "延迟"
             reasons.extend(flags)
+
     if result == "批准":
         reasons.append("现金余额、预算使用率、信用分变化均未触发硬性风控限制。")
-    action = "可以购买，但需要正式入账；非必要消费不要动用储蓄目标资金。"
-    if result == "拒绝":
-        action = "不要购买。先补现金、建预算，或等收入到账后再申请。"
-    elif result == "延迟":
-        action = "建议延迟到下一笔收入到账后再买，或者把金额拆成两周预算。"
-    return {"kind": "消费审批", "result": result, "reasons": reasons, "action": action, "metrics": {"购买金额": amount, "消费分类": category, "商户": merchant or "未填写", "当前现金余额": before["cash"], "交易后现金余额": after["cash"], "当前信用分": before["credit_score"], "交易后信用分": after["credit_score"], "信用分变化": delta["credit_score"], "品类预算上限": budget["limit"], "交易后品类已花": budget["spent"], "交易后品类预算使用率": budget["ratio"], "交易后本月支出收入比": after["spend_income_ratio"]}, "pending_tx": tx}
+    action = "不要购买。先补现金、建预算，或等收入到账后再申请。" if result == "拒绝" else "建议延迟到下一笔收入到账后再买，或者把金额拆成两周预算。" if result == "延迟" else "可以购买，但需要正式入账；非必要消费不要动用储蓄目标资金。"
+
+    return {
+        "kind": "消费审批",
+        "result": result,
+        "reasons": reasons,
+        "action": action,
+        "metrics": {
+            "购买金额": amount,
+            "消费分类": category,
+            "商户": merchant or "未填写",
+            "当前现金余额": before["cash"],
+            "交易后现金余额": after["cash"],
+            "当前信用分": before["credit_score"],
+            "交易后信用分": after["credit_score"],
+            "信用分变化": delta["credit_score"],
+            "品类预算上限": budget["limit"],
+            "交易后品类已花": budget["spent"],
+            "交易后品类预算使用率": budget["ratio"],
+            "交易后本月支出收入比": after["spend_income_ratio"],
+        },
+        "pending_tx": tx,
+    }
 
 
 def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str, expected_repayment: float, due_date: str, memo: str = "") -> Dict[str, Any]:
-    tx = make_tx("放贷", principal, "家庭贷款", borrower, memo, expected_repayment=expected_repayment, due_date=due_date)
+    tx = make_tx("放贷", principal, "家庭贷款", party=borrower, memo=memo, expected_repayment=expected_repayment, due_date=due_date)
     sim = simulate_transaction(data, tx)
     before, after, delta = sim["before"], sim["after"], sim["delta"]
     settings = data.get("settings", {})
@@ -718,8 +962,9 @@ def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str
     result = "通过"
     reasons: List[str] = []
     max_by_cash = max(0.0, before["cash"] - cash_floor) if cash_floor > 0 else max(0.0, before["cash"])
-    safe_receivable_capacity = max(0.0, soft_limit * max(before["total_assets"], 1.0) - before["receivables"])
-    suggested_limit = max(0.0, min(principal, max_by_cash, safe_receivable_capacity))
+    safe_capacity = max(0.0, soft_limit * max(before["total_assets"], 1.0) - before["receivables"])
+    suggested_limit = max(0.0, min(principal, max_by_cash, safe_capacity))
+
     if principal <= 0:
         result = "拒绝"
         reasons.append("放贷本金必须大于 0。")
@@ -732,6 +977,7 @@ def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str
     if after["credit_score"] is not None and after["credit_score"] < 650:
         result = "拒绝"
         reasons.append("放贷后信用分低于 650。")
+
     if result != "拒绝":
         flags = []
         if cash_floor > 0 and after["cash"] < cash_floor:
@@ -745,14 +991,32 @@ def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str
         if flags:
             result = "限额通过"
             reasons.extend(flags)
+
     if result == "通过":
         reasons.append("放贷后现金缓冲、贷款资产占比、信用分均未触发硬性风控限制。")
-    action = "可以放贷，但回款本金到账后应优先补充现金余额。"
-    if result == "拒绝":
-        action = "本次不建议放贷。先增加现金余额，或降低放贷金额。"
-    elif result == "限额通过":
-        action = f"建议限额放贷，最高不超过 {money(suggested_limit)}；必须写清还款日。"
-    return {"kind": "贷款审批", "result": result, "reasons": reasons, "action": action, "metrics": {"拟借出本金": principal, "借款人": borrower or "未填写", "预计回款": expected_repayment, "当前现金余额": before["cash"], "放贷后现金余额": after["cash"], "当前应收贷款本金": before["receivables"], "放贷后应收贷款本金": after["receivables"], "放贷后贷款资产占比": after["loan_asset_ratio"], "当前信用分": before["credit_score"], "放贷后信用分": after["credit_score"], "信用分变化": delta["credit_score"], "建议最高放贷金额": suggested_limit}, "pending_tx": tx}
+    action = "本次不建议放贷。先增加现金余额，或降低放贷金额。" if result == "拒绝" else f"建议限额放贷，最高不超过 {money(suggested_limit)}；必须写清还款日。" if result == "限额通过" else "可以放贷，但回款本金到账后应优先补充现金余额。"
+
+    return {
+        "kind": "贷款审批",
+        "result": result,
+        "reasons": reasons,
+        "action": action,
+        "metrics": {
+            "拟借出本金": principal,
+            "借款人": borrower or "未填写",
+            "预计回款": expected_repayment,
+            "当前现金余额": before["cash"],
+            "放贷后现金余额": after["cash"],
+            "当前应收贷款本金": before["receivables"],
+            "放贷后应收贷款本金": after["receivables"],
+            "放贷后贷款资产占比": after["loan_asset_ratio"],
+            "当前信用分": before["credit_score"],
+            "放贷后信用分": after["credit_score"],
+            "信用分变化": delta["credit_score"],
+            "建议最高放贷金额": suggested_limit,
+        },
+        "pending_tx": tx,
+    }
 
 
 def estimate_score_after_transaction(data: Dict[str, Any], tx: Dict[str, Any]) -> Dict[str, Any]:
@@ -762,18 +1026,19 @@ def estimate_score_after_transaction(data: Dict[str, Any], tx: Dict[str, Any]) -
 
 def build_risk_radar(data: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
     m = calc_financials(data)
-    ccy = m["currency"]
     risks = {"高风险": [], "中风险": [], "低风险": []}
     if not has_activity(data):
         risks["低风险"].append({"title": "账户为空", "detail": "暂无交易、暂无预算、暂无目标。请先建立收入、预算或信用分。"})
         return risks
+
     cash_floor = fnum(data.get("settings", {}).get("cash_floor"))
     if m["cash"] < 0:
-        risks["高风险"].append({"title": "现金余额为负", "detail": f"当前现金 {money(m['cash'], ccy)}，应暂停所有非必要消费。"})
+        risks["高风险"].append({"title": "现金余额为负", "detail": f"当前现金 {money(m['cash'])}，应暂停所有非必要消费。"})
     elif cash_floor > 0 and m["cash"] < cash_floor:
-        risks["中风险"].append({"title": "现金缓冲偏低", "detail": f"当前现金 {money(m['cash'], ccy)}，低于安全线 {money(cash_floor, ccy)}。"})
+        risks["中风险"].append({"title": "现金缓冲偏低", "detail": f"当前现金 {money(m['cash'])}，低于安全线 {money(cash_floor)}。"})
     else:
-        risks["低风险"].append({"title": "现金余额未触发警报", "detail": f"当前现金 {money(m['cash'], ccy)}。"})
+        risks["低风险"].append({"title": "现金余额未触发警报", "detail": f"当前现金 {money(m['cash'])}。"})
+
     if m["month_income"] > 0:
         if m["spend_income_ratio"] > 1.0:
             risks["高风险"].append({"title": "本月支出超过收入", "detail": f"支出/收入比 {percent(m['spend_income_ratio'])}。"})
@@ -781,26 +1046,32 @@ def build_risk_radar(data: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
             risks["中风险"].append({"title": "本月支出接近收入上限", "detail": f"支出/收入比 {percent(m['spend_income_ratio'])}。"})
         else:
             risks["低风险"].append({"title": "支出收入比可控", "detail": f"支出/收入比 {percent(m['spend_income_ratio'])}。"})
+
     if m["loan_asset_ratio"] > 0.60:
         risks["高风险"].append({"title": "贷款资产占比过高", "detail": f"应收贷款本金占总资产 {percent(m['loan_asset_ratio'])}，流动性弱。"})
     elif m["loan_asset_ratio"] > 0.45:
         risks["中风险"].append({"title": "贷款资产占比偏高", "detail": f"应收贷款本金占总资产 {percent(m['loan_asset_ratio'])}，建议收回部分本金。"})
     else:
         risks["低风险"].append({"title": "贷款资产占比未触发警报", "detail": f"应收贷款本金占总资产 {percent(m['loan_asset_ratio'])}。"})
+
     if m["liabilities"] > 0:
         if m["debt_asset_ratio"] > 0.35:
             risks["高风险"].append({"title": "负债偏高", "detail": f"负债占总资产 {percent(m['debt_asset_ratio'])}。"})
         else:
-            risks["中风险"].append({"title": "存在未偿还负债", "detail": f"负债余额 {money(m['liabilities'], ccy)}。"})
+            risks["中风险"].append({"title": "存在未偿还负债", "detail": f"负债余额 {money(m['liabilities'])}。"})
     else:
         risks["低风险"].append({"title": "无未偿还负债", "detail": "净资产未被负债侵蚀。"})
+
     for cat, row in m["budget_usage"].items():
-        if row["limit"] > 0 and row["ratio"] > 1.0:
+        if row["limit"] <= 0:
+            continue
+        if row["ratio"] > 1.0:
             risks["高风险"].append({"title": f"{cat}预算超支", "detail": f"使用率 {percent(row['ratio'])}。"})
-        elif row["limit"] > 0 and row["ratio"] > 0.85:
+        elif row["ratio"] > 0.85:
             risks["中风险"].append({"title": f"{cat}预算接近上限", "detail": f"使用率 {percent(row['ratio'])}。"})
+
     if m["overdue_principal"] > 0:
-        risks["高风险"].append({"title": "存在逾期贷款", "detail": f"逾期本金 {money(m['overdue_principal'], ccy)}，暂停新增放贷。"})
+        risks["高风险"].append({"title": "存在逾期贷款", "detail": f"逾期本金 {money(m['overdue_principal'])}，暂停新增放贷。"})
     return risks
 
 
@@ -834,29 +1105,24 @@ def evaluate_merchant_access(data: Dict[str, Any], merchant: Dict[str, Any]) -> 
     required_score = inum(merchant.get("required_score"), 0)
     category_cap = fnum(merchant.get("category_budget_cap"), 1.0)
     current_score = m["credit_score"]
-    checks = {"信用分达标": current_score is not None and current_score >= required_score, "现金余额为正": m["cash"] > 0, "本月支出收入比不高于 90%": m["spend_income_ratio"] <= 0.90, "该品类预算未过高": usage["ratio"] <= category_cap if usage["limit"] > 0 else True}
+    checks = {
+        "信用分达标": current_score is not None and current_score >= required_score,
+        "现金余额为正": m["cash"] > 0,
+        "本月支出收入比不高于 90%": m["spend_income_ratio"] <= 0.90,
+        "该品类预算未过高": usage["ratio"] <= category_cap if usage["limit"] > 0 else True,
+    }
     opened = all(checks.values())
     failed = [k for k, ok in checks.items() if not ok]
     if opened:
-        result, message = "开放", f"折扣开放：{fnum(merchant.get('discount')) * 100:.0f}%"
+        result = "开放"
+        message = f"折扣开放：{fnum(merchant.get('discount')) * 100:.0f}%"
     elif checks["信用分达标"]:
-        result, message = "暂缓开放", "信用分达标，但现金或预算条件未通过。"
+        result = "暂缓开放"
+        message = "信用分达标，但现金或预算条件未通过。"
     else:
-        result, message = "关闭", "信用分未达标或尚未建立。"
+        result = "关闭"
+        message = "信用分未达标或尚未建立。"
     return {"result": result, "message": message, "failed": failed, "checks": checks, "metrics": {"当前信用分": current_score, "要求信用分": required_score, "现金余额": m["cash"], "本月支出收入比": m["spend_income_ratio"], "该品类预算使用率": usage["ratio"], "品类开放上限": category_cap}}
-
-
-# -------------------------
-# DeepSeek and NL parsing
-# -------------------------
-
-def get_secret_value(key: str, default: str = "") -> str:
-    try:
-        if key in st.secrets:
-            return str(st.secrets[key])
-    except Exception:
-        pass
-    return os.getenv(key, default)
 
 
 def local_report(decision: Dict[str, Any]) -> str:
@@ -876,20 +1142,30 @@ def deepseek_decision_report(decision: Dict[str, Any]) -> str:
     if not api_key or requests is None:
         return local_report(decision)
     payload = {"kind": decision.get("kind"), "result": decision.get("result"), "metrics": decision.get("metrics"), "reasons": decision.get("reasons"), "action": decision.get("action")}
-    system_prompt = "你是阿苏私人银行2.0的中文私人银行客户经理。你只能解释 Python 已经计算好的硬指标。禁止编造数字，禁止改变审批结论。输出结构：审批结论、关键数字、风控原因、操作指令。语气克制、清楚、有银行风控感。"
+    system_prompt = "你是阿苏私人银行2.0的中文私人银行客户经理。只能解释Python已计算的硬指标，禁止编造数字，禁止改变审批结论。输出：审批结论、关键数字、风控原因、操作指令。语气克制清楚。"
     try:
-        resp = requests.post("https://api.deepseek.com/chat/completions", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json={"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)}], "temperature": 0.2, "max_tokens": 900}, timeout=20)
+        resp = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)}], "temperature": 0.2, "max_tokens": 900},
+            timeout=20,
+        )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
     except Exception as exc:
         return local_report(decision) + f"\n\n> DeepSeek 调用失败，已切换本地报告：{exc}"
 
 
+# ============================================================
+# 8. 自然语言入口
+# ============================================================
+
 def extract_amounts(text: str) -> List[float]:
     if not text:
         return []
+    patterns = [r"\$\s*([0-9]+(?:\.[0-9]+)?)", r"([0-9]+(?:\.[0-9]+)?)\s*(?:美元|刀|块|元)"]
     nums: List[float] = []
-    for p in [r"\$\s*([0-9]+(?:\.[0-9]+)?)", r"([0-9]+(?:\.[0-9]+)?)\s*(?:美元|刀|块|元)"]:
+    for p in patterns:
         for m in re.finditer(p, text, flags=re.I):
             nums.append(float(m.group(1)))
     if not nums:
@@ -900,7 +1176,14 @@ def extract_amounts(text: str) -> List[float]:
 
 def infer_category(text: str) -> str:
     s = text.lower()
-    rules = {"游戏": ["minecraft", "robux", "游戏", "道具", "皮肤", "steam", "switch"], "甜品": ["甜品", "奶茶", "冰淇淋", "蛋糕", "糖", "饮料"], "玩具": ["玩具", "lego", "乐高", "手办", "娃娃"], "学习": ["书", "学习", "课程", "文具", "作业", "训练"], "宠物": ["猫", "猫粮", "猫砂", "宠物", "罐头"], "餐饮": ["饭", "餐", "披萨", "pizza", "汉堡", "麦当劳"]}
+    rules = {
+        "游戏": ["minecraft", "robux", "游戏", "道具", "皮肤", "steam", "switch"],
+        "甜品": ["甜品", "奶茶", "冰淇淋", "蛋糕", "糖", "饮料"],
+        "玩具": ["玩具", "lego", "乐高", "手办", "娃娃"],
+        "学习": ["书", "学习", "课程", "文具", "作业", "训练"],
+        "宠物": ["猫", "猫粮", "猫砂", "宠物", "罐头"],
+        "餐饮": ["饭", "餐", "披萨", "pizza", "汉堡", "麦当劳"],
+    }
     for category, keys in rules.items():
         if any(k in s for k in keys):
             return category
@@ -932,37 +1215,40 @@ def parse_natural_request(data: Dict[str, Any], text: str) -> Dict[str, Any]:
     return {"kind": "AI 决策中心", "result": "观察", "reasons": ["没有识别出明确金额或明确动作。"], "action": "请按格式输入：我想买 $18 的 Minecraft 道具；或：借给爸爸 $20，预计一周后还 $22。", "metrics": {}, "pending_tx": None}
 
 
-# -------------------------
-# UI
-# -------------------------
+# ============================================================
+# 9. UI
+# ============================================================
 
 def inject_css() -> None:
-    st.markdown("""
-    <style>
-    .main .block-container {max-width:1280px;padding-top:1.2rem;padding-bottom:2rem;}
-    .hero {background:linear-gradient(135deg,#003C71 0%,#005EB8 50%,#0A74DA 100%);color:white;padding:26px 30px;border-radius:24px;margin-bottom:18px;box-shadow:0 16px 38px rgba(0,62,130,.25);}
-    .hero h1 {margin:0;font-size:34px;letter-spacing:.3px;}
-    .hero p {margin:8px 0 0;opacity:.93;font-size:16px;}
-    .card {border:1px solid #D6E4F5;border-radius:18px;background:white;padding:18px;box-shadow:0 8px 22px rgba(15,23,42,.06);min-height:112px;}
-    .label {color:#6B7280;font-size:13px;margin-bottom:6px;}
-    .value {font-size:28px;font-weight:780;color:#111827;line-height:1.12;}
-    .sub {color:#6B7280;font-size:12px;margin-top:6px;}
-    .decision {border:1px solid #D6E4F5;border-radius:18px;background:white;padding:18px;margin:10px 0;box-shadow:0 8px 22px rgba(15,23,42,.05);}
-    .ok {border-left:7px solid #166534;} .warn {border-left:7px solid #B45309;} .bad {border-left:7px solid #B91C1C;}
-    .pill {display:inline-block;padding:4px 10px;border-radius:999px;background:#EAF3FF;color:#003C71;border:1px solid #B9D7F6;font-size:12px;font-weight:700;margin-bottom:8px;}
-    .small {color:#6B7280;font-size:13px;}
-    div[data-testid="stMetric"] {border:1px solid #D6E4F5;border-radius:16px;padding:12px 14px;background:white;box-shadow:0 6px 18px rgba(15,23,42,.05);}
-    .stTabs [data-baseweb="tab-list"] {gap:5px;} .stTabs [data-baseweb="tab"] {border-radius:999px;background:#F2F6FB;padding:8px 13px;}
-    .stTabs [aria-selected="true"] {background:#005EB8 !important;color:white !important;}
-    </style>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+        .main .block-container { max-width: 1280px; padding-top: 1.2rem; padding-bottom: 2rem; }
+        .hero { background: linear-gradient(135deg, #003C71 0%, #005EB8 50%, #0A74DA 100%); color: white; padding: 26px 30px; border-radius: 24px; margin-bottom: 18px; box-shadow: 0 16px 38px rgba(0, 62, 130, 0.25); }
+        .hero h1 { margin: 0; font-size: 34px; letter-spacing: 0.3px; }
+        .hero p { margin: 8px 0 0; opacity: 0.93; font-size: 16px; }
+        .card { border: 1px solid #D6E4F5; border-radius: 18px; background: white; padding: 18px; box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06); min-height: 112px; }
+        .label { color: #6B7280; font-size: 13px; margin-bottom: 6px; }
+        .value { font-size: 28px; font-weight: 780; color: #111827; line-height: 1.12; }
+        .sub { color: #6B7280; font-size: 12px; margin-top: 6px; }
+        .decision { border: 1px solid #D6E4F5; border-radius: 18px; background: white; padding: 18px; margin: 10px 0; box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05); }
+        .ok { border-left: 7px solid #166534; } .warn { border-left: 7px solid #B45309; } .bad { border-left: 7px solid #B91C1C; }
+        .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #EAF3FF; color: #003C71; border: 1px solid #B9D7F6; font-size: 12px; font-weight: 700; margin-bottom: 8px; }
+        .small { color: #6B7280; font-size: 13px; }
+        div[data-testid="stMetric"] { border: 1px solid #D6E4F5; border-radius: 16px; padding: 12px 14px; background: white; box-shadow: 0 6px 18px rgba(15,23,42,0.05); }
+        .stTabs [data-baseweb="tab-list"] { gap: 5px; }
+        .stTabs [data-baseweb="tab"] { border-radius: 999px; background: #F2F6FB; padding: 8px 13px; }
+        .stTabs [aria-selected="true"] { background: #005EB8 !important; color: white !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_hero(data: Dict[str, Any]) -> None:
     owner = data.get("settings", {}).get("owner", "阿苏")
-    storage = st.session_state.get("storage_backend", "未知")
-    st.markdown(f"""<div class="hero"><h1>{APP_NAME}</h1><p>{owner} 的家庭版私人银行：交易前审批 · 交易后模拟 · 信用分影响 · 风险雷达 · Google Sheet 云端存储</p></div>""", unsafe_allow_html=True)
-    st.caption(f"当前存储：{storage}")
+    st.markdown(f"""<div class="hero"><h1>{APP_NAME}</h1><p>{owner} 的家庭版私人银行：交易前审批 · 交易后模拟 · 风险雷达 · Google Sheet 可读报表</p></div>""", unsafe_allow_html=True)
+    st.caption(f"当前存储：{st.session_state.get('storage_backend', '未知')}；主数据页：state；展示页：summary / transactions / budgets / goals / merchants / settings")
 
 
 def metric_card(label: str, value: str, sub: str = "") -> None:
@@ -971,14 +1257,13 @@ def metric_card(label: str, value: str, sub: str = "") -> None:
 
 def render_decision(decision: Dict[str, Any], data: Dict[str, Any], key: str) -> None:
     css = decision_class(decision.get("result", "观察"))
-    st.markdown(f"""<div class="decision {css}"><div class="pill">{decision.get('kind','审批')}</div><h3 style="margin:4px 0 8px;">审批结果：{decision.get('result')}</h3><p class="small">{decision.get('action','')}</p></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="decision {css}"><div class="pill">{decision.get('kind', '审批')}</div><h3 style="margin: 4px 0 8px;">审批结果：{decision.get('result')}</h3><p class="small">{decision.get('action', '')}</p></div>""", unsafe_allow_html=True)
     if decision.get("reasons"):
         st.markdown("#### 风控原因")
         for reason in decision["reasons"]:
             st.write(f"- {reason}")
     if decision.get("metrics"):
-        rows = [{"指标": k, "值": pretty_value(k, v)} for k, v in decision["metrics"].items()]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame([{"指标": k, "值": pretty_value(k, v)} for k, v in decision["metrics"].items()]), use_container_width=True, hide_index=True)
     with st.expander("AI 客户经理报告", expanded=True):
         st.markdown(deepseek_decision_report(decision))
     tx = decision.get("pending_tx")
@@ -987,9 +1272,22 @@ def render_decision(decision: Dict[str, Any], data: Dict[str, Any], key: str) ->
         if st.button("确认入账" if not disabled else "拒绝结果不可入账", disabled=disabled, type="primary", key=key):
             data.setdefault("transactions", []).append(tx)
             commit(data)
-            st.success("已入账并同步存储。")
+            st.success("已入账并同步到 state 和展示页。")
             st.rerun()
 
+
+def transactions_df(data: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for tx in data.get("transactions", []):
+        rows.append({"日期": tx.get("date"), "类型": tx.get("type"), "金额": fnum(tx.get("amount")), "分类": tx.get("category"), "对象/商户": tx.get("party"), "本金回收": fnum(tx.get("principal_repaid")), "利息收入": fnum(tx.get("interest_received")), "预计回款": fnum(tx.get("expected_repayment")), "到期日": tx.get("due_date"), "备注": tx.get("memo"), "id": tx.get("id")})
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("日期", ascending=False)
+
+
+# ============================================================
+# 10. 页面
+# ============================================================
 
 def page_home(data: Dict[str, Any]) -> None:
     m = calc_financials(data)
@@ -1008,9 +1306,11 @@ def page_home(data: Dict[str, Any]) -> None:
     left, right = st.columns([1.05, 1])
     with left:
         st.subheader("AI 本周行动计划")
-        for i, action in enumerate(build_weekly_plan(data), 1): st.write(f"**{i}.** {action}")
+        for i, action in enumerate(build_weekly_plan(data), 1):
+            st.write(f"**{i}.** {action}")
         st.subheader("信用分因子")
-        for factor in m["score_factors"]: st.write(f"- {factor}")
+        for factor in m["score_factors"]:
+            st.write(f"- {factor}")
     with right:
         st.subheader("本月预算使用率")
         rows = [{"分类": cat, "已花": row["spent"], "预算": row["limit"], "使用率": row["ratio"]} for cat, row in m["budget_usage"].items()]
@@ -1020,7 +1320,9 @@ def page_home(data: Dict[str, Any]) -> None:
         else:
             st.bar_chart(df.set_index("分类")[["使用率"]])
             show = df.copy()
-            show["已花"] = show["已花"].map(money); show["预算"] = show["预算"].map(money); show["使用率"] = show["使用率"].map(percent)
+            show["已花"] = show["已花"].map(money)
+            show["预算"] = show["预算"].map(money)
+            show["使用率"] = show["使用率"].map(percent)
             st.dataframe(show, use_container_width=True, hide_index=True)
 
 
@@ -1033,7 +1335,9 @@ def page_add_transaction(data: Dict[str, Any]) -> None:
         category = st.selectbox("分类", category_options(data))
         party = st.text_input("对象 / 商户 / 借款人", "")
         memo = st.text_area("备注", "")
-        expected_repayment = principal_repaid = interest_received = 0.0
+        expected_repayment = 0.0
+        principal_repaid = 0.0
+        interest_received = 0.0
         due_date = ""
         if tx_type == "放贷":
             expected_repayment = st.number_input("预计回款总额", min_value=0.0, step=1.0, format="%.2f")
@@ -1044,10 +1348,9 @@ def page_add_transaction(data: Dict[str, Any]) -> None:
             amount = principal_repaid + interest_received
         submitted = st.form_submit_button("保存交易", type="primary")
     if submitted:
-        tx = make_tx(tx_type, amount, category, party, memo, d.isoformat(), expected_repayment, principal_repaid, interest_received, due_date)
-        data.setdefault("transactions", []).append(tx)
+        data.setdefault("transactions", []).append(make_tx(tx_type, amount, category, party=party, memo=memo, tx_date=d.isoformat(), expected_repayment=expected_repayment, principal_repaid=principal_repaid, interest_received=interest_received, due_date=due_date))
         commit(data)
-        st.success("交易已保存并同步存储。")
+        st.success("交易已保存，state 和展示页已同步。")
         st.rerun()
 
 
@@ -1102,16 +1405,10 @@ def page_risk_radar(data: Dict[str, Any]) -> None:
             for item in risks[level]:
                 css = "bad" if level == "高风险" else "warn" if level == "中风险" else "ok"
                 st.markdown(f"""<div class="decision {css}"><b>{item['title']}</b><p class="small">{item['detail']}</p></div>""", unsafe_allow_html=True)
-    st.divider(); st.subheader("本周行动指令")
-    for i, action in enumerate(build_weekly_plan(data), 1): st.write(f"**{i}.** {action}")
-
-
-def transactions_df(data: Dict[str, Any]) -> pd.DataFrame:
-    rows = []
-    for tx in data.get("transactions", []):
-        rows.append({"日期": tx.get("date"), "类型": tx.get("type"), "金额": fnum(tx.get("amount")), "分类": tx.get("category"), "对象/商户": tx.get("party"), "本金回收": fnum(tx.get("principal_repaid")), "利息收入": fnum(tx.get("interest_received")), "预计回款": fnum(tx.get("expected_repayment")), "到期日": tx.get("due_date"), "备注": tx.get("memo"), "id": tx.get("id")})
-    if not rows: return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("日期", ascending=False)
+    st.divider()
+    st.subheader("本周行动指令")
+    for i, action in enumerate(build_weekly_plan(data), 1):
+        st.write(f"**{i}.** {action}")
 
 
 def page_monthly_statement(data: Dict[str, Any]) -> None:
@@ -1124,12 +1421,17 @@ def page_monthly_statement(data: Dict[str, Any]) -> None:
     selected = st.selectbox("选择月份", months)
     m = calc_financials(data, selected)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("本月收入", money(m["month_income"])); c2.metric("本月消费", money(m["month_expense"])); c3.metric("支出/收入比", percent(m["spend_income_ratio"])); c4.metric("信用分", score_text(m["credit_score"]))
+    c1.metric("本月收入", money(m["month_income"]))
+    c2.metric("本月消费", money(m["month_expense"]))
+    c3.metric("支出/收入比", percent(m["spend_income_ratio"]))
+    c4.metric("信用分", score_text(m["credit_score"]))
     month_df = df[df["日期"].astype(str).str[:7] == selected].copy()
     expense = month_df[month_df["类型"] == "消费"]
     if not expense.empty:
-        st.subheader("消费分类"); st.bar_chart(expense.groupby("分类")["金额"].sum().sort_values(ascending=False))
-    st.subheader("明细"); st.dataframe(month_df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
+        st.subheader("消费分类")
+        st.bar_chart(expense.groupby("分类")["金额"].sum().sort_values(ascending=False))
+    st.subheader("明细")
+    st.dataframe(month_df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
 
 
 def page_budget(data: Dict[str, Any]) -> None:
@@ -1149,9 +1451,10 @@ def page_budget(data: Dict[str, Any]) -> None:
     if submitted:
         if new_cat.strip(): new_budgets[new_cat.strip()] = new_limit
         data["budgets"] = new_budgets
-        commit(data); st.success("预算已保存并同步存储。") ; st.rerun()
-    m = calc_financials(data)
-    rows = [{"分类": cat, "已花": money(row["spent"]), "预算": money(row["limit"]), "使用率": percent(row["ratio"])} for cat, row in m["budget_usage"].items()]
+        commit(data)
+        st.success("预算已保存，展示页 budgets 已同步。")
+        st.rerun()
+    rows = [{"分类": cat, "已花": money(row["spent"]), "预算": money(row["limit"]), "使用率": percent(row["ratio"])} for cat, row in calc_financials(data)["budget_usage"].items()]
     if rows: st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
@@ -1160,9 +1463,13 @@ def page_goals(data: Dict[str, Any]) -> None:
     goals = calc_goal_status(data)
     if not goals: st.info("暂无储蓄目标。")
     for goal in goals:
-        st.markdown(f"#### {goal['name']}"); st.progress(min(1.0, goal["progress"]))
+        st.markdown(f"#### {goal['name']}")
+        st.progress(min(1.0, goal["progress"]))
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("目标", money(goal["target"])); c2.metric("当前", money(goal["current"])); c3.metric("完成度", percent(goal["progress"])); c4.metric("剩余", money(goal["remaining"]))
+        c1.metric("目标", money(goal["target"]))
+        c2.metric("当前", money(goal["current"]))
+        c3.metric("完成度", percent(goal["progress"]))
+        c4.metric("剩余", money(goal["remaining"]))
         if goal["days_left"] is not None: st.caption(f"截止日：{goal['deadline']}；剩余 {goal['days_left']} 天")
         st.divider()
     with st.form("goal_form"):
@@ -1176,7 +1483,9 @@ def page_goals(data: Dict[str, Any]) -> None:
         submitted = st.form_submit_button("新增目标", type="primary")
     if submitted and name.strip():
         data.setdefault("goals", []).append({"id": uid(), "name": name.strip(), "target": target, "current": current, "deadline": deadline.isoformat(), "category": category})
-        commit(data); st.success("目标已新增并同步存储。") ; st.rerun()
+        commit(data)
+        st.success("目标已新增，展示页 goals 已同步。")
+        st.rerun()
 
 
 def page_score(data: Dict[str, Any]) -> None:
@@ -1193,20 +1502,23 @@ def page_score(data: Dict[str, Any]) -> None:
         category = st.selectbox("分类", category_options(data))
         submitted = st.form_submit_button("模拟", type="primary")
     if submitted:
-        sim = estimate_score_after_transaction(data, make_tx(typ, amount, category, memo="信用分模拟"))
+        score = estimate_score_after_transaction(data, make_tx(typ, amount, category, memo="信用分模拟"))
         c1, c2, c3 = st.columns(3)
-        c1.metric("当前信用分", score_text(sim["current_score"])); c2.metric("交易后信用分", score_text(sim["after_score"])); c3.metric("变化", "未建立" if sim["change"] is None else sim["change"])
+        c1.metric("当前信用分", score_text(score["current_score"]))
+        c2.metric("交易后信用分", score_text(score["after_score"]))
+        c3.metric("变化", "未建立" if score["change"] is None else score["change"])
 
 
 def page_merchants(data: Dict[str, Any]) -> None:
     st.subheader("商户权益")
     if not data.get("merchants"): st.info("暂无商户权益。")
     for merchant in data.get("merchants", []):
-        result = evaluate_merchant_access(data, merchant); css = decision_class(result["result"]); failed = "无" if not result["failed"] else "；".join(result["failed"])
-        st.markdown(f"""<div class="decision {css}"><div class="pill">{merchant.get('category')}</div><h3>{merchant.get('name')}</h3><p><b>{result['message']}</b></p><p class="small">暂缓/失败原因：{failed}</p><p class="small">{merchant.get('note','')}</p></div>""", unsafe_allow_html=True)
+        result = evaluate_merchant_access(data, merchant)
+        css = decision_class(result["result"])
+        failed = "无" if not result["failed"] else "；".join(result["failed"])
+        st.markdown(f"""<div class="decision {css}"><div class="pill">{merchant.get('category')}</div><h3>{merchant.get('name')}</h3><p><b>{result['message']}</b></p><p class="small">暂缓/失败原因：{failed}</p><p class="small">{merchant.get('note', '')}</p></div>""", unsafe_allow_html=True)
         with st.expander(f"查看 {merchant.get('name')} 风控条件"):
             st.dataframe(pd.DataFrame([{"条件": k, "是否通过": "通过" if v else "未通过"} for k, v in result["checks"].items()]), use_container_width=True, hide_index=True)
-            st.dataframe(pd.DataFrame([{"指标": k, "值": pretty_value(k, v)} for k, v in result["metrics"].items()]), use_container_width=True, hide_index=True)
     st.divider()
     with st.form("merchant_form"):
         st.markdown("#### 新增商户")
@@ -1220,7 +1532,9 @@ def page_merchants(data: Dict[str, Any]) -> None:
         submitted = st.form_submit_button("新增商户", type="primary")
     if submitted and name.strip():
         data.setdefault("merchants", []).append({"id": uid(), "name": name.strip(), "category": category, "discount": discount, "required_score": int(required), "category_budget_cap": cap, "note": note})
-        commit(data); st.success("商户已新增并同步存储。") ; st.rerun()
+        commit(data)
+        st.success("商户已新增，展示页 merchants 已同步。")
+        st.rerun()
 
 
 def page_transactions(data: Dict[str, Any]) -> None:
@@ -1234,15 +1548,19 @@ def page_transactions(data: Dict[str, Any]) -> None:
         st.download_button("下载交易 CSV", csv_text.encode("utf-8-sig"), "asu_money2_transactions.csv", "text/csv")
     json_text = json.dumps(normalize_data(data), ensure_ascii=False, indent=2)
     st.download_button("下载完整 JSON 备份", json_text.encode("utf-8"), "asu_money2_backup.json", "application/json")
-    st.divider(); c1, c2, c3 = st.columns(3)
+    st.divider()
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         if st.button("重新从存储读取"):
             reload_from_storage(); st.rerun()
     with c2:
+        if st.button("手动刷新展示页"):
+            refresh_report_sheets(data); st.success("展示页已刷新。")
+    with c3:
         if st.button("删除最后一笔交易"):
             if data.get("transactions"):
-                data["transactions"].pop(); commit(data); st.success("已删除最后一笔交易并同步存储。") ; st.rerun()
-    with c3:
+                data["transactions"].pop(); commit(data); st.success("已删除最后一笔交易并同步。") ; st.rerun()
+    with c4:
         confirm = st.checkbox("确认清空所有数据")
         if st.button("清空为空库", disabled=not confirm):
             reset_empty(); st.success("已清空并同步为空库。") ; st.rerun()
@@ -1261,14 +1579,27 @@ def render_sidebar(data: Dict[str, Any]) -> None:
         hard_loan_limit = st.number_input("贷款资产硬红线", value=fnum(settings.get("hard_loan_asset_limit"), 0.65), min_value=0.0, max_value=1.0, step=0.05)
         submitted = st.form_submit_button("保存设置", type="primary")
     if submitted:
-        settings.update({"owner": owner, "start_cash": start_cash, "start_savings": start_savings, "base_score": int(base_score), "cash_floor": cash_floor, "loan_asset_limit": loan_limit, "hard_loan_asset_limit": hard_loan_limit})
-        commit(data); st.sidebar.success("设置已保存并同步存储。") ; st.rerun()
-    st.sidebar.divider(); st.sidebar.caption("连接状态")
-    if gsheet_enabled(): st.sidebar.success(f"Google Sheet：{st.secrets.get('SHEET_NAME','')}")
+        settings["owner"] = owner
+        settings["start_cash"] = start_cash
+        settings["start_savings"] = start_savings
+        settings["base_score"] = int(base_score)
+        settings["cash_floor"] = cash_floor
+        settings["loan_asset_limit"] = loan_limit
+        settings["hard_loan_asset_limit"] = hard_loan_limit
+        commit(data)
+        st.sidebar.success("设置已保存并同步。")
+        st.rerun()
+    st.sidebar.divider()
+    st.sidebar.caption("连接状态")
+    if gsheet_enabled(): st.sidebar.success(f"Google Sheet：{st.secrets.get('SHEET_NAME', '')}")
     else: st.sidebar.warning("Google Sheet 未启用，使用本地 JSON")
-    if get_secret_value("DEEPSEEK_API_KEY"): st.sidebar.success(f"DeepSeek：{get_secret_value('DEEPSEEK_MODEL','deepseek-v4-flash')}")
+    if get_secret_value("DEEPSEEK_API_KEY"): st.sidebar.success(f"DeepSeek：{get_secret_value('DEEPSEEK_MODEL', 'deepseek-v4-flash')}")
     else: st.sidebar.info("DeepSeek 未配置，使用本地报告")
 
+
+# ============================================================
+# 11. 主程序
+# ============================================================
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="🏦", layout="wide", initial_sidebar_state="expanded")
