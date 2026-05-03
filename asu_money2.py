@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-阿苏私人银行 2.1
+阿苏私人银行 2.3
 Google Sheet 云端存储版 + AI 决策中枢升级版
 
 核心升级：
-1. pending_requests 待审批队列（爸爸、妈妈均可批准）
-2. score_history 信用分历史
-3. weekly_report 周报
-4. AI 消费分类自动识别
-5. AI 情景规划：今天买 / 下周买 / 分两周买
-6. Google Sheet 自动展开展示页
+1. 登录权限：爸爸 / 妈妈 / 阿苏
+2. pending_requests 待审批队列（爸爸、妈妈均可批准）
+3. rules 风控规则表
+4. backups 自动备份与恢复
+5. score_history 信用分历史
+6. scorecard 信用评分卡
+7. rewards / badges 奖励与徽章系统
+8. 儿童首页
+9. weekly_report 周报
+10. AI 消费分类与情景规划
 
 运行：
     streamlit run asu_money2.py
@@ -83,8 +87,8 @@ except Exception:
     Credentials = None
 
 
-APP_NAME = "阿苏私人银行 2.1"
-SCHEMA_VERSION = "asu-bank-2-1"
+APP_NAME = "阿苏私人银行 2.3"
+SCHEMA_VERSION = "asu-bank-2-3"
 DATA_PATH = Path("asu_money2_data.json")
 SESSION_KEY = "asu_bank_2_1_state"
 
@@ -117,6 +121,17 @@ def empty_data() -> Dict[str, Any]:
             "auto_approve_safe_income": True,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         },
+        "rules": {
+            "budget_warning_line": 0.90,
+            "budget_reject_line": 1.20,
+            "score_reject_line": 650,
+            "approval_threshold": 15.0,
+            "loan_asset_soft_limit": 0.45,
+            "loan_asset_hard_limit": 0.65,
+            "cash_floor_default": 0.0,
+            "weekly_no_impulse_reward": 5,
+            "monthly_budget_reward": 10
+        },
         "budgets": {},
         "goals": [],
         "merchants": [],
@@ -124,6 +139,9 @@ def empty_data() -> Dict[str, Any]:
         "pending_requests": [],
         "score_history": [],
         "weekly_reports": [],
+        "backups": [],
+        "badges": [],
+        "rewards": [],
     }
 
 
@@ -223,6 +241,53 @@ def approval_hint() -> str:
     return f"当前操作人：{current_operator()}，只能提交申请，不能批准入账。"
 
 
+def can_admin() -> bool:
+    return current_operator() == "爸爸"
+
+
+def configured_passwords() -> bool:
+    try:
+        return any(k in st.secrets for k in ["DAD_PASSWORD", "MOM_PASSWORD", "ASU_PASSWORD"])
+    except Exception:
+        return False
+
+
+def require_login() -> None:
+    """如果配置了密码，则强制登录；否则沿用侧边栏身份选择。"""
+    if not configured_passwords():
+        return
+
+    if st.session_state.get("authenticated"):
+        st.session_state["current_operator"] = st.session_state.get("authenticated_role", "阿苏")
+        return
+
+    st.title("阿苏私人银行登录")
+    role = st.selectbox("选择身份", ["爸爸", "妈妈", "阿苏"])
+    password = st.text_input("密码", type="password")
+    key_map = {"爸爸": "DAD_PASSWORD", "妈妈": "MOM_PASSWORD", "阿苏": "ASU_PASSWORD"}
+    expected = secret_value(key_map[role], "")
+
+    if st.button("进入", type="primary"):
+        if expected and password == expected:
+            st.session_state["authenticated"] = True
+            st.session_state["authenticated_role"] = role
+            st.session_state["current_operator"] = role
+            st.rerun()
+        else:
+            st.error("密码错误，或该身份未配置密码。")
+    st.stop()
+
+
+def logout() -> None:
+    for k in ["authenticated", "authenticated_role"]:
+        st.session_state.pop(k, None)
+    st.rerun()
+
+
+def rule_value(data: Dict[str, Any], key: str, default: float) -> float:
+    return fnum((data.get("rules") or {}).get(key), default)
+
+
 def has_activity(data: Dict[str, Any]) -> bool:
     s = data.get("settings", {})
     return (
@@ -270,6 +335,13 @@ def normalize_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     settings["approval_threshold"] = fnum(settings.get("approval_threshold"), 15.0)
     settings["auto_approve_safe_income"] = bool(settings.get("auto_approve_safe_income", True))
     base["settings"] = settings
+
+    # 风控规则，支持从 Google Sheet 展示页查看；主数据仍以 state JSON 为准
+    rules = dict(base.get("rules", {}))
+    if isinstance(raw.get("rules"), dict):
+        for k, v in raw["rules"].items():
+            rules[str(k)] = fnum(v, rules.get(str(k), 0.0))
+    base["rules"] = rules
 
     budgets = {}
     for k, v in (raw.get("budgets") or {}).items():
@@ -373,6 +445,43 @@ def normalize_data(raw: Dict[str, Any]) -> Dict[str, Any]:
             })
     base["weekly_reports"] = weekly_reports
 
+    backups = []
+    for b in raw.get("backups") or []:
+        if isinstance(b, dict):
+            backups.append({
+                "id": b.get("id") or uid(),
+                "time": b.get("time") or now_str(),
+                "operator": b.get("operator") or "未知",
+                "event": b.get("event") or "备份",
+                "reason": b.get("reason") or "",
+                "snapshot_json": b.get("snapshot_json") or "{}",
+            })
+    base["backups"] = backups[-40:]
+
+    badges = []
+    for badge in raw.get("badges") or []:
+        if isinstance(badge, dict):
+            badges.append({
+                "id": badge.get("id") or uid(),
+                "name": badge.get("name") or "未命名徽章",
+                "earned_at": badge.get("earned_at") or now_str(),
+                "description": badge.get("description") or "",
+            })
+    base["badges"] = badges
+
+    rewards = []
+    for reward in raw.get("rewards") or []:
+        if isinstance(reward, dict):
+            rewards.append({
+                "id": reward.get("id") or uid(),
+                "title": reward.get("title") or "未命名奖励",
+                "created_at": reward.get("created_at") or now_str(),
+                "created_by": reward.get("created_by") or "",
+                "status": reward.get("status") or "可用",
+                "note": reward.get("note") or "",
+            })
+    base["rewards"] = rewards
+
     base["schema_version"] = SCHEMA_VERSION
     return base
 
@@ -448,6 +557,9 @@ def sync_readable_sheets(data: Dict[str, Any]) -> None:
         ["本月支出收入比", metrics["spend_income_ratio"], "支出 / 收入"],
         ["贷款资产占比", metrics["loan_asset_ratio"], "应收贷款本金 / 总资产"],
         ["待审批数量", len([r for r in data.get("pending_requests", []) if r.get("parent_status") == "待审批"]), "pending_requests"],
+        ["已获徽章", len(data.get("badges", [])), "badges"],
+        ["可用奖励", len([r for r in data.get("rewards", []) if r.get("status") == "可用"]), "rewards"],
+        ["备份数量", len(data.get("backups", [])), "backups"],
     ]
     set_table(get_or_create_ws(sh, "summary"), ["指标", "数值", "说明"], summary_rows)
 
@@ -536,6 +648,24 @@ def sync_readable_sheets(data: Dict[str, Any]) -> None:
             w.get("content", ""),
         ])
     set_table(get_or_create_ws(sh, "weekly_report"), ["周起始日", "生成时间", "收入", "消费", "储蓄", "信用分", "周报内容"], report_rows)
+
+    rule_rows = [[k, v] for k, v in data.get("rules", {}).items()]
+    set_table(get_or_create_ws(sh, "rules"), ["规则", "当前值"], rule_rows)
+
+    backup_rows = []
+    for b in sorted(data.get("backups", []), key=lambda x: str(x.get("time", "")), reverse=True):
+        backup_rows.append([b.get("id", ""), b.get("time", ""), b.get("operator", ""), b.get("event", ""), b.get("reason", "")])
+    set_table(get_or_create_ws(sh, "backups"), ["备份ID", "时间", "操作人", "事件", "原因"], backup_rows)
+
+    badge_rows = []
+    for badge in sorted(data.get("badges", []), key=lambda x: str(x.get("earned_at", "")), reverse=True):
+        badge_rows.append([badge.get("name", ""), badge.get("earned_at", ""), badge.get("description", "")])
+    set_table(get_or_create_ws(sh, "badges"), ["徽章", "获得时间", "说明"], badge_rows)
+
+    reward_rows = []
+    for reward in sorted(data.get("rewards", []), key=lambda x: str(x.get("created_at", "")), reverse=True):
+        reward_rows.append([reward.get("title", ""), reward.get("created_at", ""), reward.get("created_by", ""), reward.get("status", ""), reward.get("note", "")])
+    set_table(get_or_create_ws(sh, "rewards"), ["奖励", "创建时间", "创建人", "状态", "说明"], reward_rows)
 
 
 def load_data_from_gsheet() -> Dict[str, Any]:
@@ -630,9 +760,54 @@ def get_data() -> Dict[str, Any]:
     return st.session_state[SESSION_KEY]
 
 
+def strip_snapshot(data: Dict[str, Any]) -> Dict[str, Any]:
+    snap = normalize_data(data)
+    # 避免备份里套备份，控制体积
+    snap["backups"] = []
+    return snap
+
+
+def add_badge(data: Dict[str, Any], name: str, description: str) -> None:
+    existing = {b.get("name") for b in data.get("badges", [])}
+    if name not in existing:
+        data.setdefault("badges", []).append({
+            "id": uid(),
+            "name": name,
+            "earned_at": now_str(),
+            "description": description,
+        })
+
+
+def evaluate_badges(data: Dict[str, Any]) -> None:
+    metrics = calc_financials(data)
+    if any(tx.get("type") == "收入" for tx in data.get("transactions", [])):
+        add_badge(data, "第一笔收入", "已经建立现金流记录。")
+    if len(data.get("budgets", {})) >= 3:
+        add_badge(data, "预算建筑师", "已经建立至少三个预算分类。")
+    if metrics.get("credit_score") is not None:
+        add_badge(data, "信用分已建立", "风控系统已经可以追踪信用分。")
+    if metrics.get("savings", 0) > 0 or any(fnum(g.get("current")) > 0 for g in data.get("goals", [])):
+        add_badge(data, "储蓄启动", "已经开始建立储蓄或目标资金。")
+    if data.get("pending_requests"):
+        add_badge(data, "合规申请人", "已经使用待审批流程。")
+    usage = metrics.get("budget_usage", {})
+    if usage and all((r.get("limit", 0) <= 0 or r.get("ratio", 0) <= 1.0) for r in usage.values()):
+        add_badge(data, "预算守纪律", "当前预算没有超支。")
+
+
 def commit(data: Dict[str, Any], event: str = "保存数据", reason: str = "") -> None:
-    old = calc_financials(st.session_state.get(SESSION_KEY, data)).get("credit_score") if SESSION_KEY in st.session_state else None
+    old_state = normalize_data(st.session_state.get(SESSION_KEY, data)) if SESSION_KEY in st.session_state else normalize_data(data)
+    old = calc_financials(old_state).get("credit_score")
     new_data = normalize_data(data)
+    backup = {
+        "id": uid(),
+        "time": now_str(),
+        "operator": current_operator(),
+        "event": event,
+        "reason": reason or "",
+        "snapshot_json": json.dumps(strip_snapshot(old_state), ensure_ascii=False),
+    }
+    new_data["backups"] = (old_state.get("backups", []) + [backup])[-40:]
     new_score = calc_financials(new_data).get("credit_score")
     if new_score is not None:
         change = None if old is None else new_score - old
@@ -644,6 +819,7 @@ def commit(data: Dict[str, Any], event: str = "保存数据", reason: str = "") 
             "reason": reason or event,
         })
         new_data["score_history"] = new_data["score_history"][-200:]
+    evaluate_badges(new_data)
     st.session_state[SESSION_KEY] = new_data
     save_data(new_data)
 
@@ -989,7 +1165,7 @@ def evaluate_purchase_decision(data: Dict[str, Any], amount: float, category: st
     before, after, delta = sim["before"], sim["after"], sim["delta"]
     budget = usage_for(after, category)
     floor = fnum(data.get("settings", {}).get("cash_floor"))
-    threshold = fnum(data.get("settings", {}).get("approval_threshold"), 15.0)
+    threshold = rule_value(data, "approval_threshold", fnum(data.get("settings", {}).get("approval_threshold"), 15.0))
 
     result = "批准"
     reasons: List[str] = []
@@ -1000,10 +1176,10 @@ def evaluate_purchase_decision(data: Dict[str, Any], amount: float, category: st
     if after["cash"] < 0:
         result = "拒绝"
         reasons.append("购买后现金余额为负，触发硬性拒绝。")
-    if budget["limit"] > 0 and budget["ratio"] > 1.20:
+    if budget["limit"] > 0 and budget["ratio"] > rule_value(data, "budget_reject_line", 1.20):
         result = "拒绝"
         reasons.append(f"{category}预算使用率将达到 {percent(budget['ratio'])}，超过 120% 红线。")
-    if after["credit_score"] is not None and after["credit_score"] < 650:
+    if after["credit_score"] is not None and after["credit_score"] < rule_value(data, "score_reject_line", 650):
         result = "拒绝"
         reasons.append("交易后信用分低于 650，进入高风险区。")
 
@@ -1013,7 +1189,7 @@ def evaluate_purchase_decision(data: Dict[str, Any], amount: float, category: st
             flags.append(f"金额达到家长审批线 {money(threshold)}。")
         if floor > 0 and after["cash"] < floor:
             flags.append(f"购买后现金余额低于安全线 {money(floor)}。")
-        if budget["limit"] > 0 and budget["ratio"] >= 0.90:
+        if budget["limit"] > 0 and budget["ratio"] >= rule_value(data, "budget_warning_line", 0.90):
             flags.append(f"{category}预算使用率将达到 {percent(budget['ratio'])}，接近或超过上限。")
         if delta["credit_score"] is not None and delta["credit_score"] <= -8:
             flags.append(f"信用分预计下降 {abs(delta['credit_score'])} 分。")
@@ -1064,8 +1240,8 @@ def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str
     before, after, delta = sim["before"], sim["after"], sim["delta"]
     s = data.get("settings", {})
     floor = fnum(s.get("cash_floor"))
-    soft = fnum(s.get("loan_asset_limit"), 0.45)
-    hard = fnum(s.get("hard_loan_asset_limit"), 0.65)
+    soft = rule_value(data, "loan_asset_soft_limit", fnum(s.get("loan_asset_limit"), 0.45))
+    hard = rule_value(data, "loan_asset_hard_limit", fnum(s.get("hard_loan_asset_limit"), 0.65))
 
     result = "通过"
     reasons: List[str] = []
@@ -1082,7 +1258,7 @@ def evaluate_loan_decision(data: Dict[str, Any], principal: float, borrower: str
     if after["total_assets"] > 0 and after["loan_asset_ratio"] > hard:
         result = "拒绝"
         reasons.append(f"放贷后应收贷款本金占总资产 {percent(after['loan_asset_ratio'])}，超过 {percent(hard)} 红线。")
-    if after["credit_score"] is not None and after["credit_score"] < 650:
+    if after["credit_score"] is not None and after["credit_score"] < rule_value(data, "score_reject_line", 650):
         result = "拒绝"
         reasons.append("放贷后信用分低于 650。")
 
@@ -1554,7 +1730,7 @@ def render_hero(data: Dict[str, Any]) -> None:
         f"""
         <div class="hero">
             <h1>{APP_NAME}</h1>
-            <p>{owner} 的家庭金融审批系统：AI 分类 · 情景规划 · 家长审批 · 信用分历史 · 自动周报</p>
+            <p>{owner} 的家庭金融审批系统：密码权限 · AI分类 · 家长审批 · 备份恢复 · 奖励徽章 · 自动周报</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1815,6 +1991,184 @@ def page_loan(data: Dict[str, Any]) -> None:
         render_decision(st.session_state["loan_decision"], data, "loan")
 
 
+def build_scorecard(data: Dict[str, Any]) -> pd.DataFrame:
+    m = calc_financials(data)
+    rows = []
+    cash_floor = fnum(data.get("settings", {}).get("cash_floor"))
+    cash_score = 200 if cash_floor <= 0 or m["cash"] >= cash_floor * 2 else 140 if m["cash"] >= cash_floor else 80 if m["cash"] >= 0 else 20
+    rows.append(["现金纪律", cash_score, 200, "现金余额与安全线"])
+
+    usage = m.get("budget_usage", {})
+    if usage:
+        max_ratio = max((r.get("ratio", 0) for r in usage.values()), default=0)
+        budget_score = 200 if max_ratio <= 0.75 else 160 if max_ratio <= 0.90 else 110 if max_ratio <= 1.0 else 50
+    else:
+        budget_score = 80
+    rows.append(["预算纪律", budget_score, 200, "预算使用率与超支情况"])
+
+    savings_score = 150 if m["savings_asset_ratio"] >= 0.30 else 110 if m["savings_asset_ratio"] >= 0.15 else 70 if m["savings"] > 0 else 30
+    rows.append(["储蓄纪律", savings_score, 150, "储蓄占总资产比例"])
+
+    loan_ratio = m["loan_asset_ratio"]
+    loan_score = 150 if loan_ratio <= 0.25 else 110 if loan_ratio <= 0.45 else 70 if loan_ratio <= 0.65 else 20
+    rows.append(["贷款纪律", loan_score, 150, "应收贷款占总资产比例"])
+
+    debt_ratio = m["debt_asset_ratio"]
+    debt_score = 100 if debt_ratio == 0 else 80 if debt_ratio <= 0.15 else 50 if debt_ratio <= 0.35 else 10
+    rows.append(["负债纪律", debt_score, 100, "负债占总资产比例"])
+
+    stability_score = 100 if len(data.get("score_history", [])) >= 5 else 70 if len(data.get("transactions", [])) >= 3 else 40
+    rows.append(["稳定性", stability_score, 100, "记录连续性与系统使用频率"])
+
+    df = pd.DataFrame(rows, columns=["项目", "得分", "满分", "说明"])
+    df["完成度"] = df["得分"] / df["满分"]
+    return df
+
+
+def page_child_dashboard(data: Dict[str, Any]) -> None:
+    st.subheader("儿童首页")
+    st.caption("阿苏常用入口：申请购买、看信用分、看奖励、看审批结果。")
+    m = calc_financials(data)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("我的现金", money(m["cash"]))
+    c2.metric("我的信用分", score_text(m["credit_score"]))
+    c3.metric("待审批", len([r for r in data.get("pending_requests", []) if r.get("parent_status") == "待审批"]))
+    c4.metric("徽章", len(data.get("badges", [])))
+
+    st.markdown("#### 我要买东西")
+    text = st.text_area("把想买的东西写在这里", value="我想买 $5 的甜品", key="child_request_text")
+    if st.button("提交购买申请", type="primary"):
+        cls = ai_classify_purchase(text)
+        amounts = extract_amounts(text)
+        amount = amounts[0] if amounts else 0.0
+        decision = evaluate_purchase_decision(data, amount, cls["category"], text, cls["merchant"])
+        tx = decision.get("pending_tx")
+        req = {
+            "id": uid(),
+            "created_at": now_str(),
+            "request_text": text,
+            "request_type": "消费",
+            "amount": amount,
+            "category": cls["category"],
+            "merchant": cls["merchant"],
+            "applicant": current_operator(),
+            "ai_category": cls["category"],
+            "necessity": cls["necessity"],
+            "impulse_level": cls["impulse_level"],
+            "python_decision": decision.get("result", ""),
+            "parent_status": "待审批",
+            "final_status": "未入账",
+            "decision_json": decision,
+            "pending_tx": tx,
+            "parent_note": "",
+            "approved_by": "",
+            "approved_at": "",
+            "booked_at": "",
+        }
+        data.setdefault("pending_requests", []).append(req)
+        commit(data, event="儿童首页提交申请", reason=text)
+        st.success("申请已提交给爸爸/妈妈审批。")
+        st.rerun()
+
+    st.markdown("#### 我的徽章")
+    if not data.get("badges"):
+        st.info("还没有徽章。先记录收入、建立预算或提交一次合规申请。")
+    else:
+        st.dataframe(pd.DataFrame(data.get("badges", []))[['name','earned_at','description']], use_container_width=True, hide_index=True)
+
+    st.markdown("#### 我的待审批")
+    mine = [r for r in data.get("pending_requests", []) if r.get("applicant") == current_operator()]
+    if not mine:
+        st.info("暂无申请。")
+    else:
+        st.dataframe(pd.DataFrame(mine)[["created_at","amount","category","parent_status","final_status","request_text"]], use_container_width=True, hide_index=True)
+
+
+def page_rules(data: Dict[str, Any]) -> None:
+    st.subheader("风控规则")
+    st.caption("这些规则写入 state 主数据，并同步到 Google Sheet 的 rules 展示页。")
+    rules = data.setdefault("rules", empty_data()["rules"])
+    if not can_admin():
+        st.warning("只有爸爸管理员可以修改风控规则。")
+        st.dataframe(pd.DataFrame([{"规则": k, "当前值": v} for k, v in rules.items()]), use_container_width=True, hide_index=True)
+        return
+    with st.form("rules_form"):
+        new_rules = {}
+        labels = {
+            "budget_warning_line": "预算预警线",
+            "budget_reject_line": "预算拒绝线",
+            "score_reject_line": "信用分拒绝线",
+            "approval_threshold": "家长审批金额线",
+            "loan_asset_soft_limit": "贷款资产建议线",
+            "loan_asset_hard_limit": "贷款资产硬红线",
+            "cash_floor_default": "默认现金安全线",
+            "weekly_no_impulse_reward": "周度无冲动消费奖励分",
+            "monthly_budget_reward": "月度预算纪律奖励分",
+        }
+        for k, default in empty_data()["rules"].items():
+            new_rules[k] = st.number_input(labels.get(k, k), value=fnum(rules.get(k, default)), step=0.05 if "line" in k or "limit" in k else 1.0, format="%.2f")
+        submitted = st.form_submit_button("保存规则", type="primary")
+    if submitted:
+        data["rules"] = new_rules
+        commit(data, event="保存风控规则", reason="rules updated")
+        st.success("规则已保存。")
+        st.rerun()
+
+
+def page_backups(data: Dict[str, Any]) -> None:
+    st.subheader("备份与恢复")
+    st.caption("每次保存都会自动备份上一个版本。只保留最近 40 次。")
+    backups = data.get("backups", [])
+    if not backups:
+        st.info("暂无备份。")
+        return
+    df = pd.DataFrame([{k: b.get(k) for k in ["id","time","operator","event","reason"]} for b in backups]).sort_values("time", ascending=False)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    if not can_admin():
+        st.warning("只有爸爸管理员可以恢复备份。")
+        return
+    options = [f"{b.get('time')} · {b.get('operator')} · {b.get('event')} · {b.get('id')}" for b in sorted(backups, key=lambda x: str(x.get('time','')), reverse=True)]
+    selected = st.selectbox("选择要恢复的备份", options)
+    selected_id = selected.split(" · ")[-1]
+    if st.button("恢复到这个版本", type="primary"):
+        backup = next((b for b in backups if b.get("id") == selected_id), None)
+        if backup:
+            restored = normalize_data(json.loads(backup.get("snapshot_json") or "{}"))
+            restored["backups"] = backups
+            commit(restored, event="恢复备份", reason=selected_id)
+            st.success("已恢复备份。")
+            st.rerun()
+
+
+def page_rewards(data: Dict[str, Any]) -> None:
+    st.subheader("奖励与徽章")
+    evaluate_badges(data)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### 徽章")
+        if not data.get("badges"):
+            st.info("暂无徽章。")
+        else:
+            st.dataframe(pd.DataFrame(data.get("badges", []))[["name","earned_at","description"]], use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("#### 奖励券")
+        if not data.get("rewards"):
+            st.info("暂无奖励券。")
+        else:
+            st.dataframe(pd.DataFrame(data.get("rewards", []))[["title","created_at","created_by","status","note"]], use_container_width=True, hide_index=True)
+    st.divider()
+    if can_approve():
+        with st.form("reward_form"):
+            title = st.text_input("奖励名称", "周末小额自由消费券")
+            note = st.text_input("说明", "用于奖励预算纪律或储蓄进度")
+            submitted = st.form_submit_button("发放奖励", type="primary")
+        if submitted and title.strip():
+            data.setdefault("rewards", []).append({"id": uid(), "title": title.strip(), "created_at": now_str(), "created_by": current_operator(), "status": "可用", "note": note})
+            commit(data, event="发放奖励", reason=title)
+            st.success("奖励已发放。")
+            st.rerun()
+
+
 def page_pending(data: Dict[str, Any]) -> None:
     st.subheader("待审批队列")
     st.caption(approval_hint())
@@ -2008,6 +2362,11 @@ def page_score(data: Dict[str, Any]) -> None:
     for f in m["score_factors"]:
         st.write(f"- {f}")
     st.divider()
+    st.markdown("#### 信用评分卡")
+    card = build_scorecard(data)
+    st.dataframe(card, use_container_width=True, hide_index=True)
+    st.bar_chart(card.set_index("项目")[["完成度"]])
+    st.divider()
     st.markdown("#### 信用分历史")
     hist = pd.DataFrame(data.get("score_history", []))
     if hist.empty:
@@ -2100,22 +2459,34 @@ def page_transactions(data: Dict[str, Any]) -> None:
 def render_sidebar(data: Dict[str, Any]) -> None:
     st.sidebar.title("系统设置")
 
-    operators = ["爸爸", "妈妈", "阿苏"]
-    current = st.session_state.get("current_operator", "爸爸")
-    idx = operators.index(current) if current in operators else 0
-    st.sidebar.selectbox(
-        "当前操作人",
-        operators,
-        index=idx,
-        key="current_operator",
-        help="爸爸和妈妈拥有批准权限；阿苏只能提交申请。"
-    )
-    if can_approve():
+    if configured_passwords():
+        st.sidebar.success(f"已登录：{current_operator()}")
+        if st.sidebar.button("退出登录"):
+            logout()
+    else:
+        operators = ["爸爸", "妈妈", "阿苏"]
+        current = st.session_state.get("current_operator", "爸爸")
+        idx = operators.index(current) if current in operators else 0
+        st.sidebar.selectbox(
+            "当前操作人",
+            operators,
+            index=idx,
+            key="current_operator",
+            help="未配置密码时可手动切换；正式使用建议配置 DAD_PASSWORD / MOM_PASSWORD / ASU_PASSWORD。"
+        )
+        st.sidebar.warning("未启用密码登录，当前身份可手动切换。")
+
+    if can_admin():
+        st.sidebar.success("爸爸管理员：可改设置、规则、备份恢复")
+    elif can_approve():
         st.sidebar.success(f"{current_operator()}拥有审批权限")
     else:
         st.sidebar.info("阿苏只能提交申请，不能批准入账")
 
     s = data.setdefault("settings", {})
+    if not can_admin():
+        st.sidebar.caption("系统设置仅爸爸管理员可修改。")
+        return
     with st.sidebar.form("settings_form"):
         owner = st.text_input("账户名称", s.get("owner", "阿苏"))
         start_cash = st.number_input("初始现金", value=fnum(s.get("start_cash")), step=1.0, format="%.2f")
@@ -2154,54 +2525,67 @@ def render_sidebar(data: Dict[str, Any]) -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="🏦", layout="wide", initial_sidebar_state="expanded")
     inject_css()
+    require_login()
     data = get_data()
     render_sidebar(data)
     render_hero(data)
 
     tabs = st.tabs([
-        "1 首页总览",
-        "2 新增交易",
-        "3 AI 决策中心",
-        "4 消费审批",
-        "5 贷款审批",
-        "6 待审批队列",
-        "7 风险雷达",
-        "8 月度账单",
-        "9 预算管理",
-        "10 储蓄目标",
-        "11 信用分",
-        "12 商户权益",
-        "13 周报",
-        "14 交易流水",
+        "1 儿童首页",
+        "2 首页总览",
+        "3 新增交易",
+        "4 AI 决策中心",
+        "5 消费审批",
+        "6 贷款审批",
+        "7 待审批队列",
+        "8 风险雷达",
+        "9 月度账单",
+        "10 预算管理",
+        "11 储蓄目标",
+        "12 信用分",
+        "13 商户权益",
+        "14 周报",
+        "15 奖励徽章",
+        "16 风控规则",
+        "17 备份恢复",
+        "18 交易流水",
     ])
 
     with tabs[0]:
-        page_home(data)
+        page_child_dashboard(data)
     with tabs[1]:
-        page_add_transaction(data)
+        page_home(data)
     with tabs[2]:
-        page_ai_center(data)
+        page_add_transaction(data)
     with tabs[3]:
-        page_purchase(data)
+        page_ai_center(data)
     with tabs[4]:
-        page_loan(data)
+        page_purchase(data)
     with tabs[5]:
-        page_pending(data)
+        page_loan(data)
     with tabs[6]:
-        page_risk_radar(data)
+        page_pending(data)
     with tabs[7]:
-        page_monthly_statement(data)
+        page_risk_radar(data)
     with tabs[8]:
-        page_budget(data)
+        page_monthly_statement(data)
     with tabs[9]:
-        page_goals(data)
+        page_budget(data)
     with tabs[10]:
-        page_score(data)
+        page_goals(data)
     with tabs[11]:
-        page_merchants(data)
+        page_score(data)
     with tabs[12]:
-        page_weekly(data)
+        page_merchants(data)
     with tabs[13]:
+        page_weekly(data)
+    with tabs[14]:
+        page_rewards(data)
+    with tabs[15]:
+        page_rules(data)
+    with tabs[16]:
+        page_backups(data)
+    with tabs[17]:
         page_transactions(data)
 
 
