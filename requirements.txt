@@ -3,3 +3,7 @@ pandas
 requests
 gspread
 google-auth
+plotly
+openpyxl
+numpy
+matplotlib
