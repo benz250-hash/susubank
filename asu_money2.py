@@ -1341,8 +1341,9 @@ def _build_sheet_tables(data: Dict[str, Any], scope: str = "core") -> Dict[str, 
 def sync_readable_sheets(data: Dict[str, Any], scope: str = "core") -> Dict[str, Any]:
     """低配额 Google Sheet 展示页刷新。
 
-    以前逐表执行 clear + update，十几张表会产生几十个 write requests，容易触发 429。
-    现在用 batch_clear + values_batch_update：已有工作表情况下，一次刷新通常只消耗约 2 个写请求。
+    兼容 gspread：不再调用 Spreadsheet.batch_clear()，因为部分 gspread 版本没有这个方法。
+    做法：用 values_batch_update 一次性写入各展示页，并把目标区域补空白，顺便覆盖旧内容。
+    已有 worksheet 情况下，核心刷新通常只需要 1 个 values 批量写请求。
     """
     if not gsheet_enabled():
         raise RuntimeError("Google Sheet 未配置。")
@@ -1354,28 +1355,31 @@ def sync_readable_sheets(data: Dict[str, Any], scope: str = "core") -> Dict[str,
     existing_titles = {ws.title for ws in sh.worksheets()}
     for title, table in tables.items():
         if title not in existing_titles:
-            # 新建 worksheet 会消耗写请求。首次初始化如果仍遇到 429，等一分钟后重试即可。
+            # 新建 worksheet 仍会消耗写请求。首次初始化如果遇到 429，等一分钟后重试。
             sh.add_worksheet(title=title, rows=max(table["min_rows"], len(table["rows"]) + 10), cols=max(table["cols"], 2))
 
-    clear_ranges: List[str] = []
     updates: List[Dict[str, Any]] = []
     for title, table in tables.items():
         header = table["header"]
         rows = table["rows"]
         cols = table["cols"]
+        # 写满固定区域，用空白覆盖旧数据，避免再单独 clear。
         row_count = max(table["min_rows"], len(rows) + 1)
-        values = [header] + rows
-        clear_ranges.append(_sheet_a1_range(title, row_count, cols))
+        values = _pad_sheet_values([header] + rows, row_count, cols)
         updates.append({
-            "range": _sheet_a1_range(title, len(values), cols),
-            "values": _pad_sheet_values(values, len(values), cols),
+            "range": _sheet_a1_range(title, row_count, cols),
+            "values": values,
         })
 
-    # 两个批量请求，替代原来的几十个逐表请求。
-    if clear_ranges:
-        sh.batch_clear(clear_ranges)
     if updates:
-        sh.values_batch_update({"valueInputOption": "RAW", "data": updates})
+        if hasattr(sh, "values_batch_update"):
+            sh.values_batch_update({"valueInputOption": "RAW", "data": updates})
+        else:
+            # 极老 gspread 兜底：逐表 update。会更慢，但不会调用不存在的 batch_clear。
+            for item in updates:
+                title = item["range"].split("!", 1)[0].strip("'").replace("''", "'")
+                ws = sh.worksheet(title)
+                ws.update(item["range"].split("!", 1)[1], item["values"], value_input_option="RAW")
 
     return {"scope": scope, "sheet_count": len(tables), "updated_at": now_str()}
 
