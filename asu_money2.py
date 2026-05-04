@@ -1346,6 +1346,12 @@ def plotly_enabled() -> bool:
     return px is not None and go is not None
 
 
+def next_chart_key(prefix: str = "plotly") -> str:
+    """Avoid StreamlitDuplicateElementId when identical Plotly figures appear in different tabs."""
+    st.session_state["_asu_plotly_chart_counter"] = st.session_state.get("_asu_plotly_chart_counter", 0) + 1
+    return f"{prefix}_{st.session_state['_asu_plotly_chart_counter']}"
+
+
 def render_asset_mix_chart(metrics: Dict[str, Any]) -> None:
     rows = [{"资产类别": "现金", "金额": max(0.0, fnum(metrics.get("cash")))}, {"资产类别": "储蓄", "金额": max(0.0, fnum(metrics.get("savings")))}, {"资产类别": "应收贷款本金", "金额": max(0.0, fnum(metrics.get("receivables")))}]
     df = pd.DataFrame([r for r in rows if r["金额"] > 0])
@@ -1353,7 +1359,7 @@ def render_asset_mix_chart(metrics: Dict[str, Any]) -> None:
     if plotly_enabled():
         fig = px.pie(df, names="资产类别", values="金额", title="资产结构")
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=320)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=next_chart_key("plotly"))
     else:
         st.bar_chart(df.set_index("资产类别"))
 
@@ -1370,7 +1376,7 @@ def render_budget_usage_chart(metrics: Dict[str, Any]) -> None:
     if plotly_enabled():
         fig = px.bar(df, x="分类", y=["已花", "剩余预算"], barmode="stack", title="预算使用情况")
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=340)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=next_chart_key("plotly"))
     else:
         st.bar_chart(df.set_index("分类"))
 
@@ -1388,7 +1394,7 @@ def render_credit_score_chart(score_history: List[Dict[str, Any]]) -> None:
         y_cols = ["score"] + (["三次移动平均"] if "三次移动平均" in df.columns else [])
         fig = px.line(df, x="time", y=y_cols, markers=True, title="信用分走势")
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=340, yaxis_title="信用分", xaxis_title="时间")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=next_chart_key("plotly"))
     else:
         st.line_chart(df.set_index("time")[["score"]])
 
@@ -1402,7 +1408,7 @@ def render_monthly_spending_chart(rows: List[Dict[str, Any]], currency: str) -> 
     if plotly_enabled():
         fig = px.bar(df, x="分类", y="金额", title=f"本月消费分类（{currency}）")
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=340)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=next_chart_key("plotly"))
     else:
         st.bar_chart(df.set_index("分类"))
 
@@ -1422,7 +1428,7 @@ def render_monthly_cashflow_trend(data: Dict[str, Any]) -> None:
     if plotly_enabled():
         fig = px.bar(grouped, x="月份", y="金额", color="项目", barmode="group", title="月度现金流趋势")
         fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=340)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=next_chart_key("plotly"))
     else:
         st.bar_chart(grouped.pivot(index="月份", columns="项目", values="金额").fillna(0))
 
@@ -2196,7 +2202,7 @@ def page_score_full(data: Dict[str, Any]) -> None:
     st.dataframe(card, use_container_width=True, hide_index=True)
     if plotly_enabled():
         fig = px.bar(card, x="项目", y="完成度", title="信用评分卡完成度")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=next_chart_key("plotly"))
     else:
         st.bar_chart(card.set_index("项目")[["完成度"]])
     st.markdown("#### 信用分历史")
@@ -2463,6 +2469,7 @@ def page_audit_full(data: Dict[str, Any]) -> None:
 
 
 def page_full_control_panel(data: Dict[str, Any]) -> None:
+    # Legacy debug panel retained in code but no longer exposed in sidebar.
     st.title("完整功能面板")
     st.caption("保留原版银行功能：输入、输出、评估、审批、账务、报表、风控、备份、Google Sheet、奖励、赏金任务。")
     tabs = st.tabs([
@@ -2503,13 +2510,15 @@ def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="🏦", layout="wide")
     inject_css(); require_login()
     data = get_data(); render_sidebar(data)
+    # Reset per-run chart counter so Plotly widgets get deterministic unique IDs.
+    st.session_state["_asu_plotly_chart_counter"] = 0
+
     mode = st.sidebar.radio(
         "页面",
-        ["完整功能面板", "阿苏首页", "家长工作台", "私人银行后台", "系统设置"],
+        ["阿苏首页", "家长工作台", "私人银行后台", "系统设置"],
         index=0,
     )
-    if mode == "完整功能面板": page_full_control_panel(data)
-    elif mode == "阿苏首页": page_asu_home(data)
+    if mode == "阿苏首页": page_asu_home(data)
     elif mode == "家长工作台": page_parent_workspace(data)
     elif mode == "私人银行后台": page_bank_backend(data)
     else: page_settings(data)
