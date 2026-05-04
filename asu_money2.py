@@ -26,6 +26,7 @@ requirements.txt：
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
@@ -67,6 +68,11 @@ try:
     import openpyxl  # noqa: F401
 except Exception:
     openpyxl = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 
 APP_NAME = "阿苏私人银行 3.0 完整版"
@@ -388,6 +394,10 @@ def normalize_data(raw: Any) -> Dict[str, Any]:
                 "claimed_at": b.get("claimed_at") or "",
                 "submitted_at": b.get("submitted_at") or "",
                 "submission_note": b.get("submission_note") or "",
+                "submission_image_name": b.get("submission_image_name") or "",
+                "submission_image_mime": b.get("submission_image_mime") or "",
+                "submission_image_data": b.get("submission_image_data") or "",
+                "submission_image_size": inum(b.get("submission_image_size"), 0),
                 "reviewed_by": b.get("reviewed_by") or "",
                 "reviewed_at": b.get("reviewed_at") or "",
                 "parent_note": b.get("parent_note") or "",
@@ -1301,8 +1311,8 @@ def _build_sheet_tables(data: Dict[str, Any], scope: str = "core") -> Dict[str, 
     pending_rows = [[r.get("created_at", ""), r.get("applicant", ""), r.get("request_type", ""), r.get("amount", 0), r.get("category", ""), r.get("python_decision", ""), r.get("parent_status", ""), r.get("final_status", ""), r.get("approved_by", ""), r.get("request_text", ""), r.get("parent_note", "")] for r in sorted(data.get("pending_requests", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
     add("pending_requests", ["申请时间", "申请人", "类型", "金额", "分类", "系统结论", "家长状态", "最终状态", "审批人", "原始申请", "家长备注"], pending_rows, min_rows=200)
 
-    bounty_rows = [[b.get("title", ""), b.get("status", ""), b.get("reward_amount", 0), b.get("reward_points", 0), b.get("difficulty", ""), b.get("deadline", ""), b.get("created_by", ""), b.get("assigned_to", ""), b.get("submission_note", ""), b.get("reviewed_by", ""), b.get("parent_note", "")] for b in sorted(data.get("bounties", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
-    add("bounties", ["任务", "状态", "赏金", "积分", "难度", "截止日", "发布人", "领取人", "提交说明", "审核人", "家长备注"], bounty_rows, min_rows=200)
+    bounty_rows = [[b.get("title", ""), b.get("status", ""), b.get("reward_amount", 0), b.get("reward_points", 0), b.get("difficulty", ""), b.get("deadline", ""), b.get("created_by", ""), b.get("assigned_to", ""), b.get("submission_note", ""), "有" if b.get("submission_image_data") else "无", b.get("submission_image_name", ""), b.get("reviewed_by", ""), b.get("parent_note", "")] for b in sorted(data.get("bounties", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
+    add("bounties", ["任务", "状态", "赏金", "积分", "难度", "截止日", "发布人", "领取人", "提交说明", "照片证据", "照片文件", "审核人", "家长备注"], bounty_rows, min_rows=200)
 
     loan_rows = [[l.get("loan_id"), l.get("date"), l.get("borrower"), l.get("principal"), l.get("repaid"), l.get("remaining"), l.get("expected_repayment"), l.get("expected_interest"), l.get("interest_received"), l.get("due_date"), l.get("status"), l.get("memo")] for l in m["loans"]]
     add("loan_book", ["贷款ID", "日期", "借款人", "本金", "已还本金", "剩余本金", "预计回款", "预计利息", "已收利息", "到期日", "状态", "备注"], loan_rows, min_rows=120)
@@ -1551,6 +1561,63 @@ def render_monthly_cashflow_trend(data: Dict[str, Any]) -> None:
         st.bar_chart(grouped.pivot(index="月份", columns="项目", values="金额").fillna(0))
 
 
+
+
+def encode_bounty_image(uploaded_file: Any, max_bytes: int = 850_000) -> Tuple[Optional[Dict[str, Any]], str]:
+    """把阿苏上传的任务照片转为可存入 state JSON 的证据对象。
+
+    优先用 Pillow 压缩到 JPEG，避免 Google Sheet state 过大；没有 Pillow 时，
+    只接受较小原图。返回 (evidence, error_message)。
+    """
+    if uploaded_file is None:
+        return None, ""
+    raw = uploaded_file.getvalue()
+    name = getattr(uploaded_file, "name", "submission_image") or "submission_image"
+    mime = getattr(uploaded_file, "type", "image/jpeg") or "image/jpeg"
+    try:
+        if Image is not None:
+            img = Image.open(BytesIO(raw))
+            img = img.convert("RGB")
+            img.thumbnail((1200, 1200))
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=78, optimize=True)
+            raw = out.getvalue()
+            mime = "image/jpeg"
+            if not name.lower().endswith(('.jpg', '.jpeg')):
+                name = re.sub(r"\.[^.]+$", "", name) + ".jpg"
+        if len(raw) > max_bytes:
+            return None, f"图片压缩后仍有 {len(raw)//1024}KB，超过上限 {max_bytes//1024}KB。请裁剪或换一张小图。"
+        return {
+            "submission_image_name": name,
+            "submission_image_mime": mime,
+            "submission_image_data": base64.b64encode(raw).decode("ascii"),
+            "submission_image_size": len(raw),
+        }, ""
+    except Exception as exc:
+        return None, f"图片处理失败：{exc}"
+
+
+def clear_bounty_image(b: Dict[str, Any]) -> None:
+    b["submission_image_name"] = ""
+    b["submission_image_mime"] = ""
+    b["submission_image_data"] = ""
+    b["submission_image_size"] = 0
+
+
+def render_bounty_evidence(b: Dict[str, Any], key_prefix: str = "bounty_evidence") -> None:
+    """在家长审核/历史记录中显示任务证据。"""
+    data64 = b.get("submission_image_data") or ""
+    if not data64:
+        st.caption("未上传照片证据。")
+        return
+    try:
+        raw = base64.b64decode(data64)
+        caption = b.get("submission_image_name") or "任务照片"
+        size_kb = inum(b.get("submission_image_size"), len(raw)) // 1024
+        st.image(raw, caption=f"{caption} · {size_kb}KB", width=420)
+    except Exception as exc:
+        st.warning(f"照片证据无法显示：{exc}")
+
 def render_decision(decision: Dict[str, Any]) -> None:
     css = decision_class(decision.get("result", "观察"))
     st.markdown(f"<div class='decision {css}'><div class='pill'>{decision.get('kind')}</div><h3>结论：{decision.get('result')}</h3><p class='small'>{decision.get('action','')}</p></div>", unsafe_allow_html=True)
@@ -1648,11 +1715,29 @@ def page_asu_home(data: Dict[str, Any]) -> None:
     for b in my_bounties:
         with st.expander(f"{b.get('title')} · {b.get('status')} · {money(b.get('reward_amount'), ccy)}", expanded=b.get("status") in {"已领取", "已退回"}):
             st.write(b.get("description") or "无说明")
+            if b.get("submission_image_data"):
+                render_bounty_evidence(b, key_prefix=f"current_evidence_{b['id']}")
             if b.get("status") in {"已领取", "已退回"} and current_operator() == CHILD:
                 note = st.text_area("完成说明", value=b.get("submission_note", ""), key=f"submit_note_{b['id']}")
+                uploaded = st.file_uploader("上传完成照片（可选，支持 JPG/PNG/WebP）", type=["jpg", "jpeg", "png", "webp"], key=f"submit_image_{b['id']}")
+                remove_old = False
+                if b.get("submission_image_data"):
+                    remove_old = st.checkbox("删除已上传照片", key=f"remove_image_{b['id']}")
                 if st.button("提交完成，等待家长审核", key=f"submit_bounty_{b['id']}"):
-                    b["status"] = "已提交"; b["submission_note"] = note; b["submitted_at"] = now_str()
-                    commit(data, event="提交赏金任务", reason=b.get("title", "")); st.rerun()
+                    if not note.strip() and uploaded is None and not b.get("submission_image_data"):
+                        st.warning("请至少填写文字说明或上传一张完成照片。")
+                    else:
+                        if remove_old:
+                            clear_bounty_image(b)
+                        if uploaded is not None:
+                            evidence, err = encode_bounty_image(uploaded)
+                            if err:
+                                st.error(err)
+                                st.stop()
+                            if evidence:
+                                b.update(evidence)
+                        b["status"] = "已提交"; b["submission_note"] = note; b["submitted_at"] = now_str()
+                        commit(data, event="提交赏金任务", reason=b.get("title", "")); st.rerun()
 
     st.markdown("### 我的审批状态")
     mine = [r for r in data.get("pending_requests", []) if r.get("applicant") in {current_operator(), CHILD}]
@@ -1712,13 +1797,13 @@ def page_parent_workspace(data: Dict[str, Any]) -> None:
             with c5: deadline = st.date_input("截止日", value=date.today() + timedelta(days=7)).isoformat()
             submit = st.form_submit_button("发布任务", type="primary", disabled=not can_parent())
         if submit:
-            data.setdefault("bounties", []).append({"id": uid(), "title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline, "status": "开放", "created_by": current_operator(), "created_at": now_str(), "assigned_to": "", "claimed_at": "", "submitted_at": "", "submission_note": "", "reviewed_by": "", "reviewed_at": "", "parent_note": "", "paid_tx_id": ""})
+            data.setdefault("bounties", []).append({"id": uid(), "title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline, "status": "开放", "created_by": current_operator(), "created_at": now_str(), "assigned_to": "", "claimed_at": "", "submitted_at": "", "submission_note": "", "submission_image_name": "", "submission_image_mime": "", "submission_image_data": "", "submission_image_size": 0, "reviewed_by": "", "reviewed_at": "", "parent_note": "", "paid_tx_id": ""})
             commit(data, event="发布赏金任务", reason=title); st.success("赏金任务已发布。"); st.rerun()
         rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to")} for b in sorted(active_bounties(data), key=lambda x: str(x.get("created_at", "")), reverse=True)]
         dataframe_or_empty(rows, empty_text="暂无当前赏金任务。已支付/已取消任务已进入历史。")
         if historical_bounties(data):
             with st.expander(f"已完成/已取消任务历史（{len(historical_bounties(data))}）", expanded=False):
-                history_rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "领取人": b.get("assigned_to"), "审核人": b.get("reviewed_by"), "审核时间": b.get("reviewed_at")} for b in sorted(historical_bounties(data), key=lambda x: str(x.get("reviewed_at") or x.get("created_at") or ""), reverse=True)]
+                history_rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "领取人": b.get("assigned_to"), "审核人": b.get("reviewed_by"), "审核时间": b.get("reviewed_at"), "照片": "有" if b.get("submission_image_data") else "无"} for b in sorted(historical_bounties(data), key=lambda x: str(x.get("reviewed_at") or x.get("created_at") or ""), reverse=True)]
                 dataframe_or_empty(history_rows)
         st.divider()
         st.markdown("#### 修改/删除当前任务")
@@ -1758,6 +1843,7 @@ def page_parent_workspace(data: Dict[str, Any]) -> None:
         if not submitted: st.info("暂无待审核任务。")
         for b in submitted:
             st.markdown(f"<div class='bounty'><h4>{b.get('title')}</h4><p class='small'>{b.get('description')}</p><p>提交说明：{b.get('submission_note') or '未填写'}</p><div class='pill'>赏金 {money(b.get('reward_amount'))} · 积分 {b.get('reward_points')}</div></div>", unsafe_allow_html=True)
+            render_bounty_evidence(b, key_prefix=f"review_evidence_{b['id']}")
             note = st.text_input("审核备注", key=f"review_note_{b['id']}")
             c1, c2 = st.columns(2)
             with c1:
@@ -2631,7 +2717,7 @@ def page_bounties_full(data: Dict[str, Any]) -> None:
             deadline = c2.date_input("截止日", value=date.today() + timedelta(days=7), key="full_bounty_deadline").isoformat()
             submit = st.form_submit_button("发布任务", type="primary", disabled=not can_parent())
         if submit:
-            data.setdefault("bounties", []).append({"id": uid(), "title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline, "status": "开放", "created_by": current_operator(), "created_at": now_str(), "assigned_to": "", "claimed_at": "", "submitted_at": "", "submission_note": "", "reviewed_by": "", "reviewed_at": "", "parent_note": "", "paid_tx_id": ""})
+            data.setdefault("bounties", []).append({"id": uid(), "title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline, "status": "开放", "created_by": current_operator(), "created_at": now_str(), "assigned_to": "", "claimed_at": "", "submitted_at": "", "submission_note": "", "submission_image_name": "", "submission_image_mime": "", "submission_image_data": "", "submission_image_size": 0, "reviewed_by": "", "reviewed_at": "", "parent_note": "", "paid_tx_id": ""})
             commit(data, event="发布赏金任务", reason=title)
             st.rerun()
 
@@ -2642,6 +2728,7 @@ def page_bounties_full(data: Dict[str, Any]) -> None:
         for b in submitted:
             bid = b.get("id") or uid()
             st.markdown(f"<div class='bounty'><h4>{b.get('title')}</h4><p class='small'>{b.get('description')}</p><p>提交说明：{b.get('submission_note') or '未填写'}</p><div class='pill'>赏金 {money(b.get('reward_amount'))} · 积分 {b.get('reward_points')}</div></div>", unsafe_allow_html=True)
+            render_bounty_evidence(b, key_prefix=f"full_review_evidence_{bid}")
             note = st.text_input("审核备注", key=f"full_bounty_review_note_{bid}")
             c1, c2 = st.columns(2)
             if c1.button("通过并发放赏金", key=f"full_bounty_pay_{bid}", disabled=not can_parent(), type="primary"):
@@ -2658,7 +2745,7 @@ def page_bounties_full(data: Dict[str, Any]) -> None:
 
     with tab4:
         history = sorted(historical_bounties(data), key=lambda x: str(x.get("reviewed_at") or x.get("created_at") or ""), reverse=True)
-        rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to"), "审核人": b.get("reviewed_by"), "审核时间": b.get("reviewed_at")} for b in history]
+        rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to"), "审核人": b.get("reviewed_by"), "审核时间": b.get("reviewed_at"), "照片": "有" if b.get("submission_image_data") else "无"} for b in history]
         dataframe_or_empty(rows, empty_text="暂无历史任务。")
         st.caption("已支付任务已经转成收入交易，默认不建议删除；如需纠错，请到交易流水删除对应收入，再重发任务。")
 
