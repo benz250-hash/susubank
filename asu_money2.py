@@ -310,14 +310,19 @@ def normalize_data(raw: Any) -> Dict[str, Any]:
     goals = []
     for g in raw.get("goals") or []:
         if isinstance(g, dict):
+            target = fnum(g.get("target"))
+            current = fnum(g.get("current"))
+            status = g.get("status") or ("已完成" if target > 0 and current >= target else "进行中")
             goals.append({
                 "id": g.get("id") or uid(),
                 "name": g.get("name") or "未命名目标",
-                "target": fnum(g.get("target")),
-                "current": fnum(g.get("current")),
+                "target": target,
+                "current": current,
                 "deadline": g.get("deadline") or "",
                 "category": g.get("category") or "长期储蓄",
                 "note": g.get("note") or "",
+                "status": status,
+                "archived_at": g.get("archived_at") or "",
             })
     base["goals"] = goals
 
@@ -727,7 +732,10 @@ def calc_goals(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             d = safe_date(g["deadline"])
             if d:
                 days_left = (d - today).days
-        out.append({**g, "progress": progress, "remaining": max(0.0, target - current), "days_left": days_left})
+        status = g.get("status") or "进行中"
+        if status == "进行中" and target > 0 and current >= target:
+            status = "已完成"
+        out.append({**g, "status": status, "progress": progress, "remaining": max(0.0, target - current), "days_left": days_left})
     return out
 
 
@@ -874,6 +882,30 @@ def has_activity(data: Dict[str, Any]) -> bool:
 
 def category_options(data: Dict[str, Any]) -> List[str]:
     return sorted(set(DEFAULT_CATEGORIES + list(data.get("budgets", {}).keys())))
+
+
+def is_goal_active(g: Dict[str, Any]) -> bool:
+    return (g.get("status") or "进行中") not in {"已完成", "已归档", "已删除"}
+
+
+def active_goals_from_metrics(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [g for g in metrics.get("goals", []) if is_goal_active(g)]
+
+
+def archived_goals_from_metrics(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [g for g in metrics.get("goals", []) if not is_goal_active(g)]
+
+
+def is_bounty_active(b: Dict[str, Any]) -> bool:
+    return (b.get("status") or "开放") not in {"已支付", "已取消", "已归档", "已删除"}
+
+
+def active_bounties(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [b for b in data.get("bounties", []) if is_bounty_active(b)]
+
+
+def historical_bounties(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [b for b in data.get("bounties", []) if not is_bounty_active(b)]
 
 
 def add_badge(data: Dict[str, Any], name: str, description: str) -> None:
@@ -1508,14 +1540,15 @@ def page_asu_home(data: Dict[str, Any]) -> None:
     left, right = st.columns([1, 1])
     with left:
         st.markdown("#### 我的储蓄目标")
-        if not m["goals"]: st.info("还没有储蓄目标。")
-        for g in m["goals"]:
+        shown_goals = active_goals_from_metrics(m)
+        if not shown_goals: st.info("还没有进行中的储蓄目标。已完成目标会记录在后台历史里。")
+        for g in shown_goals:
             st.write(f"**{g['name']}** · {money(g['current'], ccy)} / {money(g['target'], ccy)}")
             st.progress(min(1.0, fnum(g["progress"])))
             st.caption(f"还差 {money(g['remaining'], ccy)}；截止日：{g.get('deadline') or '未设置'}")
     with right:
         st.markdown("#### 可领取赏金任务")
-        open_bounties = [b for b in data.get("bounties", []) if b.get("status") == "开放"]
+        open_bounties = [b for b in active_bounties(data) if b.get("status") == "开放"]
         if not open_bounties: st.info("暂无开放任务。")
         for b in open_bounties[:6]:
             st.markdown(f"<div class='bounty'><h4>{b.get('title')}</h4><p class='small'>{b.get('description')}</p><div class='pill'>赏金 {money(b.get('reward_amount'), ccy)} · {b.get('reward_points')}分 · {b.get('difficulty')}</div></div>", unsafe_allow_html=True)
@@ -1524,7 +1557,7 @@ def page_asu_home(data: Dict[str, Any]) -> None:
                 commit(data, event="领取赏金任务", reason=b.get("title", "")); st.rerun()
 
     st.markdown("### 我的任务进度")
-    my_bounties = [b for b in data.get("bounties", []) if b.get("assigned_to") == current_operator() or (current_operator() == CHILD and b.get("assigned_to") == CHILD)]
+    my_bounties = [b for b in active_bounties(data) if b.get("assigned_to") == current_operator() or (current_operator() == CHILD and b.get("assigned_to") == CHILD)]
     if not my_bounties: st.info("你还没有领取任务。")
     for b in my_bounties:
         with st.expander(f"{b.get('title')} · {b.get('status')} · {money(b.get('reward_amount'), ccy)}", expanded=b.get("status") in {"已领取", "已退回"}):
@@ -1595,8 +1628,44 @@ def page_parent_workspace(data: Dict[str, Any]) -> None:
         if submit:
             data.setdefault("bounties", []).append({"id": uid(), "title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline, "status": "开放", "created_by": current_operator(), "created_at": now_str(), "assigned_to": "", "claimed_at": "", "submitted_at": "", "submission_note": "", "reviewed_by": "", "reviewed_at": "", "parent_note": "", "paid_tx_id": ""})
             commit(data, event="发布赏金任务", reason=title); st.success("赏金任务已发布。"); st.rerun()
-        rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to")} for b in sorted(data.get("bounties", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
-        dataframe_or_empty(rows, empty_text="暂无赏金任务。")
+        rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to")} for b in sorted(active_bounties(data), key=lambda x: str(x.get("created_at", "")), reverse=True)]
+        dataframe_or_empty(rows, empty_text="暂无当前赏金任务。已支付/已取消任务已进入历史。")
+        if historical_bounties(data):
+            with st.expander(f"已完成/已取消任务历史（{len(historical_bounties(data))}）", expanded=False):
+                history_rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "领取人": b.get("assigned_to"), "审核人": b.get("reviewed_by"), "审核时间": b.get("reviewed_at")} for b in sorted(historical_bounties(data), key=lambda x: str(x.get("reviewed_at") or x.get("created_at") or ""), reverse=True)]
+                dataframe_or_empty(history_rows)
+        st.divider()
+        st.markdown("#### 修改/删除当前任务")
+        active_for_edit = sorted(active_bounties(data), key=lambda x: str(x.get("created_at", "")), reverse=True)
+        if not active_for_edit:
+            st.caption("暂无可修改任务。")
+        for b in active_for_edit:
+            bid = b.get("id") or uid()
+            with st.expander(f"管理：{b.get('title')} · {b.get('status')}", expanded=False):
+                with st.form(f"parent_edit_bounty_{bid}"):
+                    c1, c2, c3 = st.columns(3)
+                    title2 = c1.text_input("任务标题", b.get("title", ""), key=f"parent_edit_title_{bid}")
+                    amount2 = c2.number_input("赏金金额", min_value=0.0, value=fnum(b.get("reward_amount")), step=1.0, format="%.2f", key=f"parent_edit_amount_{bid}")
+                    points2 = c3.number_input("信用积分", min_value=0, value=inum(b.get("reward_points"), 0), step=1, key=f"parent_edit_points_{bid}")
+                    desc2 = st.text_area("任务说明", b.get("description", ""), key=f"parent_edit_desc_{bid}")
+                    category2 = c1.text_input("任务分类", b.get("category", "家庭任务"), key=f"parent_edit_category_{bid}")
+                    difficulty2 = c2.selectbox("难度", ["简单", "普通", "困难"], index=["简单", "普通", "困难"].index(b.get("difficulty")) if b.get("difficulty") in ["简单", "普通", "困难"] else 1, key=f"parent_edit_difficulty_{bid}")
+                    old_deadline2 = safe_date(b.get("deadline")) or date.today() + timedelta(days=7)
+                    deadline2 = c3.date_input("截止日", value=old_deadline2, key=f"parent_edit_deadline_{bid}").isoformat()
+                    saved2 = st.form_submit_button("保存修改", disabled=not can_parent())
+                if saved2:
+                    b.update({"title": title2.strip() or "未命名任务", "description": desc2.strip(), "reward_amount": amount2, "reward_points": int(points2), "category": category2.strip() or "家庭任务", "difficulty": difficulty2, "deadline": deadline2})
+                    commit(data, event="修改赏金任务", reason=b.get("title", ""))
+                    st.rerun()
+                c1, c2 = st.columns(2)
+                if c1.button("取消并转入历史", key=f"parent_cancel_bounty_{bid}", disabled=not can_parent()):
+                    b["status"] = "已取消"; b["reviewed_by"] = current_operator(); b["reviewed_at"] = now_str()
+                    commit(data, event="取消赏金任务", reason=b.get("title", ""))
+                    st.rerun()
+                if c2.button("删除未完成任务", key=f"parent_delete_bounty_{bid}", disabled=not can_parent()):
+                    data["bounties"] = [x for x in data.get("bounties", []) if x.get("id") != bid]
+                    commit(data, event="删除赏金任务", reason=b.get("title", ""))
+                    st.rerun()
     with tab3:
         st.subheader("任务审核")
         submitted = [b for b in data.get("bounties", []) if b.get("status") == "已提交"]
@@ -1733,18 +1802,7 @@ def page_bank_backend(data: Dict[str, Any]) -> None:
         if submit:
             data.setdefault("budgets", {})[cat.strip() or "其他"] = limit
             commit(data, event="保存预算", reason=f"{cat}={limit}"); st.rerun()
-        st.divider(); st.subheader("储蓄目标")
-        for g in m["goals"]:
-            st.write(f"**{g['name']}** · {money(g['current'], m['currency'])} / {money(g['target'], m['currency'])}"); st.progress(min(1.0, fnum(g["progress"])))
-        with st.form("goal_form"):
-            c1, c2, c3 = st.columns(3)
-            with c1: name = st.text_input("目标名称", "猫咪基金"); goal_cat = st.text_input("目标分类", "长期储蓄")
-            with c2: target = st.number_input("目标金额", min_value=0.0, value=100.0, step=5.0, format="%.2f"); current = st.number_input("当前金额", min_value=0.0, value=0.0, step=5.0, format="%.2f")
-            with c3: deadline = st.date_input("截止日", value=date.today() + timedelta(days=90)).isoformat(); note = st.text_input("说明", "")
-            submit = st.form_submit_button("新增储蓄目标", disabled=not can_parent())
-        if submit:
-            data.setdefault("goals", []).append({"id": uid(), "name": name, "target": target, "current": current, "deadline": deadline, "category": goal_cat, "note": note})
-            commit(data, event="新增储蓄目标", reason=name); st.rerun()
+        st.divider(); page_goals_full(data)
     with tab5:
         st.subheader("月度账单")
         selected_month = st.text_input("月份", month_str())
@@ -2162,18 +2220,58 @@ def page_budget_full(data: Dict[str, Any]) -> None:
 
 def page_goals_full(data: Dict[str, Any]) -> None:
     st.subheader("储蓄目标")
+    st.caption("家长可以修改、归档或删除目标；已完成/已归档目标不会在阿苏首页继续显示，但仍保留在历史记录里。")
     m = calc_financials(data)
-    if not m["goals"]:
-        st.info("暂无储蓄目标。")
-    for g in m["goals"]:
-        st.markdown(f"#### {g['name']}")
-        st.progress(min(1.0, fnum(g["progress"])))
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("目标", money(g["target"], m["currency"]))
-        c2.metric("当前", money(g["current"], m["currency"]))
-        c3.metric("完成度", percent(g["progress"]))
-        c4.metric("剩余", money(g["remaining"], m["currency"]))
-        st.caption(f"截止日：{g.get('deadline') or '未设置'}；分类：{g.get('category')}")
+    active = active_goals_from_metrics(m)
+    archived = archived_goals_from_metrics(m)
+
+    st.markdown("#### 进行中的目标")
+    if not active:
+        st.info("暂无进行中的储蓄目标。")
+    for g in active:
+        gid = g.get("id") or uid()
+        with st.expander(f"{g.get('name')} · {money(g.get('current'), m['currency'])} / {money(g.get('target'), m['currency'])}", expanded=False):
+            st.progress(min(1.0, fnum(g.get("progress"))))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("目标", money(g.get("target"), m["currency"]))
+            c2.metric("当前", money(g.get("current"), m["currency"]))
+            c3.metric("完成度", percent(g.get("progress")))
+            c4.metric("剩余", money(g.get("remaining"), m["currency"]))
+            st.caption(f"截止日：{g.get('deadline') or '未设置'}；分类：{g.get('category')}；状态：{g.get('status')}")
+
+            with st.form(f"edit_goal_{gid}"):
+                ec1, ec2, ec3 = st.columns(3)
+                new_name = ec1.text_input("目标名称", g.get("name", ""), key=f"goal_name_{gid}")
+                new_target = ec2.number_input("目标金额", min_value=0.0, value=fnum(g.get("target")), step=5.0, format="%.2f", key=f"goal_target_{gid}")
+                new_current = ec3.number_input("当前金额", min_value=0.0, value=fnum(g.get("current")), step=5.0, format="%.2f", key=f"goal_current_{gid}")
+                new_category = ec1.text_input("分类", g.get("category", "长期储蓄"), key=f"goal_category_{gid}")
+                old_deadline = safe_date(g.get("deadline")) or date.today() + timedelta(days=90)
+                new_deadline = ec2.date_input("截止日", value=old_deadline, key=f"goal_deadline_{gid}").isoformat()
+                new_note = ec3.text_input("说明", g.get("note", ""), key=f"goal_note_{gid}")
+                save = st.form_submit_button("保存修改", disabled=not can_parent())
+            if save:
+                g.update({"name": new_name.strip() or "未命名目标", "target": new_target, "current": new_current, "category": new_category.strip() or "长期储蓄", "deadline": new_deadline, "note": new_note, "status": "已完成" if new_target > 0 and new_current >= new_target else "进行中"})
+                commit(data, event="修改储蓄目标", reason=g.get("name", ""))
+                st.rerun()
+
+            b1, b2, b3 = st.columns(3)
+            if b1.button("标记完成并归档", key=f"goal_archive_{gid}", disabled=not can_parent()):
+                g["status"] = "已完成"
+                g["archived_at"] = now_str()
+                commit(data, event="完成储蓄目标", reason=g.get("name", ""))
+                st.rerun()
+            if b2.button("仅归档", key=f"goal_only_archive_{gid}", disabled=not can_parent()):
+                g["status"] = "已归档"
+                g["archived_at"] = now_str()
+                commit(data, event="归档储蓄目标", reason=g.get("name", ""))
+                st.rerun()
+            if b3.button("删除目标", key=f"goal_delete_{gid}", disabled=not can_parent()):
+                data["goals"] = [x for x in data.get("goals", []) if x.get("id") != gid]
+                commit(data, event="删除储蓄目标", reason=g.get("name", ""))
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### 新增储蓄目标")
     with st.form("full_goal_form"):
         c1, c2, c3 = st.columns(3)
         name = c1.text_input("目标名称", "猫咪基金", key="full_goal_name")
@@ -2184,9 +2282,26 @@ def page_goals_full(data: Dict[str, Any]) -> None:
         note = c3.text_input("说明", "", key="full_goal_note")
         submit = st.form_submit_button("新增储蓄目标", disabled=not can_parent())
     if submit:
-        data.setdefault("goals", []).append({"id": uid(), "name": name.strip() or "未命名目标", "target": target, "current": current, "deadline": deadline, "category": category, "note": note})
+        data.setdefault("goals", []).append({"id": uid(), "name": name.strip() or "未命名目标", "target": target, "current": current, "deadline": deadline, "category": category, "note": note, "status": "已完成" if target > 0 and current >= target else "进行中", "archived_at": ""})
         commit(data, event="新增储蓄目标", reason=name)
         st.rerun()
+
+    if archived:
+        st.divider()
+        with st.expander(f"已完成/已归档目标历史（{len(archived)}）", expanded=False):
+            rows = [{"目标": g.get("name"), "状态": g.get("status"), "目标金额": money(g.get("target"), m["currency"]), "当前金额": money(g.get("current"), m["currency"]), "分类": g.get("category"), "截止日": g.get("deadline"), "归档时间": g.get("archived_at")} for g in archived]
+            dataframe_or_empty(rows)
+            if can_parent():
+                options = [f"{g.get('name')} · {g.get('id')}" for g in archived]
+                selected = st.selectbox("恢复一个历史目标", options, key="restore_goal_select")
+                selected_id = selected.split(" · ")[-1]
+                if st.button("恢复为进行中", key="restore_goal_btn"):
+                    for g in data.get("goals", []):
+                        if g.get("id") == selected_id:
+                            g["status"] = "进行中"
+                            g["archived_at"] = ""
+                            commit(data, event="恢复储蓄目标", reason=g.get("name", ""))
+                            st.rerun()
 
 
 def page_score_full(data: Dict[str, Any]) -> None:
@@ -2375,10 +2490,46 @@ def page_transactions_full(data: Dict[str, Any]) -> None:
 
 def page_bounties_full(data: Dict[str, Any]) -> None:
     st.subheader("赏金任务")
-    tab1, tab2, tab3 = st.tabs(["任务列表", "发布任务", "审核/发放"])
+    st.caption("默认只显示未完成任务；已支付、已取消、已归档的任务会进入历史记录，不再打扰主流程。")
+    tab1, tab2, tab3, tab4 = st.tabs(["当前任务", "发布任务", "审核/发放", "历史记录"])
+
     with tab1:
-        rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "难度": b.get("difficulty"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to"), "提交说明": b.get("submission_note"), "审核人": b.get("reviewed_by")} for b in sorted(data.get("bounties", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
-        dataframe_or_empty(rows, empty_text="暂无赏金任务。")
+        active = sorted(active_bounties(data), key=lambda x: str(x.get("created_at", "")), reverse=True)
+        if not active:
+            st.info("暂无当前任务。已完成任务在历史记录里。")
+        for b in active:
+            bid = b.get("id") or uid()
+            with st.expander(f"{b.get('title')} · {b.get('status')} · {money(b.get('reward_amount'))}", expanded=False):
+                st.write(b.get("description") or "无说明")
+                st.caption(f"积分：{b.get('reward_points')}；难度：{b.get('difficulty')}；截止日：{b.get('deadline') or '未设置'}；领取人：{b.get('assigned_to') or '未领取'}")
+                if can_parent():
+                    with st.form(f"edit_bounty_{bid}"):
+                        c1, c2, c3 = st.columns(3)
+                        title = c1.text_input("任务标题", b.get("title", ""), key=f"edit_bounty_title_{bid}")
+                        reward_amount = c2.number_input("赏金金额", min_value=0.0, value=fnum(b.get("reward_amount")), step=1.0, format="%.2f", key=f"edit_bounty_amount_{bid}")
+                        reward_points = c3.number_input("信用积分", min_value=0, value=inum(b.get("reward_points"), 0), step=1, key=f"edit_bounty_points_{bid}")
+                        desc = st.text_area("任务说明", b.get("description", ""), key=f"edit_bounty_desc_{bid}")
+                        category = c1.text_input("任务分类", b.get("category", "家庭任务"), key=f"edit_bounty_category_{bid}")
+                        difficulty = c2.selectbox("难度", ["简单", "普通", "困难"], index=["简单", "普通", "困难"].index(b.get("difficulty")) if b.get("difficulty") in ["简单", "普通", "困难"] else 1, key=f"edit_bounty_difficulty_{bid}")
+                        old_deadline = safe_date(b.get("deadline")) or date.today() + timedelta(days=7)
+                        deadline = c3.date_input("截止日", value=old_deadline, key=f"edit_bounty_deadline_{bid}").isoformat()
+                        saved = st.form_submit_button("保存修改")
+                    if saved:
+                        b.update({"title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline})
+                        commit(data, event="修改赏金任务", reason=b.get("title", ""))
+                        st.rerun()
+                    c1, c2 = st.columns(2)
+                    if c1.button("取消并归档", key=f"cancel_bounty_{bid}"):
+                        b["status"] = "已取消"
+                        b["reviewed_by"] = current_operator()
+                        b["reviewed_at"] = now_str()
+                        commit(data, event="取消赏金任务", reason=b.get("title", ""))
+                        st.rerun()
+                    if c2.button("删除未完成任务", key=f"delete_bounty_{bid}"):
+                        data["bounties"] = [x for x in data.get("bounties", []) if x.get("id") != bid]
+                        commit(data, event="删除赏金任务", reason=b.get("title", ""))
+                        st.rerun()
+
     with tab2:
         with st.form("full_bounty_form"):
             title = st.text_input("任务标题", "整理书桌并拍照提交", key="full_bounty_title")
@@ -2394,25 +2545,33 @@ def page_bounties_full(data: Dict[str, Any]) -> None:
             data.setdefault("bounties", []).append({"id": uid(), "title": title.strip() or "未命名任务", "description": desc.strip(), "reward_amount": reward_amount, "reward_points": int(reward_points), "category": category.strip() or "家庭任务", "difficulty": difficulty, "deadline": deadline, "status": "开放", "created_by": current_operator(), "created_at": now_str(), "assigned_to": "", "claimed_at": "", "submitted_at": "", "submission_note": "", "reviewed_by": "", "reviewed_at": "", "parent_note": "", "paid_tx_id": ""})
             commit(data, event="发布赏金任务", reason=title)
             st.rerun()
+
     with tab3:
         submitted = [b for b in data.get("bounties", []) if b.get("status") == "已提交"]
         if not submitted:
             st.info("暂无待审核任务。")
         for b in submitted:
+            bid = b.get("id") or uid()
             st.markdown(f"<div class='bounty'><h4>{b.get('title')}</h4><p class='small'>{b.get('description')}</p><p>提交说明：{b.get('submission_note') or '未填写'}</p><div class='pill'>赏金 {money(b.get('reward_amount'))} · 积分 {b.get('reward_points')}</div></div>", unsafe_allow_html=True)
-            note = st.text_input("审核备注", key=f"full_bounty_review_note_{b['id']}")
+            note = st.text_input("审核备注", key=f"full_bounty_review_note_{bid}")
             c1, c2 = st.columns(2)
-            if c1.button("通过并发放赏金", key=f"full_bounty_pay_{b['id']}", disabled=not can_parent(), type="primary"):
+            if c1.button("通过并发放赏金", key=f"full_bounty_pay_{bid}", disabled=not can_parent(), type="primary"):
                 b["status"] = "已支付"; b["reviewed_by"] = current_operator(); b["reviewed_at"] = now_str(); b["parent_note"] = note
                 tx = make_tx("收入", fnum(b.get("reward_amount")), "赏金任务", party=current_operator(), memo=f"赏金任务：{b.get('title')}", bounty_id=b.get("id"))
                 b["paid_tx_id"] = tx["id"]
                 data.setdefault("transactions", []).append(tx)
                 commit(data, event="发放赏金", reason=b.get("title", ""))
                 st.rerun()
-            if c2.button("退回修改", key=f"full_bounty_return_{b['id']}", disabled=not can_parent()):
+            if c2.button("退回修改", key=f"full_bounty_return_{bid}", disabled=not can_parent()):
                 b["status"] = "已退回"; b["reviewed_by"] = current_operator(); b["reviewed_at"] = now_str(); b["parent_note"] = note
                 commit(data, event="退回赏金任务", reason=b.get("title", ""))
                 st.rerun()
+
+    with tab4:
+        history = sorted(historical_bounties(data), key=lambda x: str(x.get("reviewed_at") or x.get("created_at") or ""), reverse=True)
+        rows = [{"标题": b.get("title"), "状态": b.get("status"), "赏金": money(b.get("reward_amount")), "积分": b.get("reward_points"), "截止日": b.get("deadline"), "发布人": b.get("created_by"), "领取人": b.get("assigned_to"), "审核人": b.get("reviewed_by"), "审核时间": b.get("reviewed_at")} for b in history]
+        dataframe_or_empty(rows, empty_text="暂无历史任务。")
+        st.caption("已支付任务已经转成收入交易，默认不建议删除；如需纠错，请到交易流水删除对应收入，再重发任务。")
 
 
 def page_google_sheet_full(data: Dict[str, Any]) -> None:
