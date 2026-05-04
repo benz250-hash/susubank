@@ -1246,56 +1246,138 @@ def generate_weekly_report(data: Dict[str, Any]) -> Dict[str, Any]:
 # 6. Google Sheet 展示页和 Excel
 # ============================================================
 
-def sync_readable_sheets(data: Dict[str, Any]) -> None:
-    if not gsheet_enabled():
-        raise RuntimeError("Google Sheet 未配置。")
-    data = normalize_data(data); sh = get_spreadsheet(); m = calc_financials(data)
-    summary_rows = [["更新时间", now_str(), "手动刷新展示页"], ["总资产", m["total_assets"], "现金 + 储蓄 + 应收贷款本金"], ["净资产", m["net_assets"], "总资产 - 负债"], ["现金余额", m["cash"], "可立即使用资金"], ["储蓄余额", m["savings"], "储蓄账户余额"], ["应收贷款本金", m["receivables"], "未收回本金"], ["负债余额", m["liabilities"], "未偿还借入资金"], ["今日可安全花", m["safe_to_spend"], "现金安全线和预算约束后的可用额"], ["信用分", score_text(m["credit_score"]), "家庭内部风控评分"], ["本月收入", m["month_income"], month_str()], ["本月消费", m["month_expense"], month_str()], ["待审批数量", len([r for r in data.get("pending_requests", []) if r.get("parent_status") == "待审批"]), "pending_requests"], ["开放赏金任务", len([b for b in data.get("bounties", []) if b.get("status") == "开放"]), "bounties"]]
-    set_table(get_or_create_ws(sh, "summary"), ["指标", "数值", "说明"], summary_rows)
+def _sheet_a1_range(title: str, rows: int, cols: int) -> str:
+    safe_title = str(title).replace("'", "''")
+    return f"'{safe_title}'!A1:{col_letters(cols)}{rows}"
+
+
+def _pad_sheet_values(values: List[List[Any]], rows: int, cols: int) -> List[List[Any]]:
+    out: List[List[Any]] = []
+    for row in values[:rows]:
+        fixed = list(row[:cols])
+        fixed += [""] * (cols - len(fixed))
+        out.append(fixed)
+    while len(out) < rows:
+        out.append([""] * cols)
+    return out
+
+
+def _build_sheet_tables(data: Dict[str, Any], scope: str = "core") -> Dict[str, Dict[str, Any]]:
+    """生成 Google Sheet 展示页数据。
+
+    scope="core"：只刷常用核心表，避免 Sheets API 429。
+    scope="full"：刷全部展示表，低频使用。
+    """
+    data = normalize_data(data)
+    m = calc_financials(data)
+
+    tables: Dict[str, Dict[str, Any]] = {}
+    def add(name: str, header: List[str], rows: List[List[Any]], min_rows: int = 80) -> None:
+        tables[name] = {"header": header, "rows": rows, "min_rows": min_rows, "cols": len(header)}
+
+    summary_rows = [
+        ["更新时间", now_str(), "手动刷新展示页"],
+        ["总资产", m["total_assets"], "现金 + 储蓄 + 应收贷款本金"],
+        ["净资产", m["net_assets"], "总资产 - 负债"],
+        ["现金余额", m["cash"], "可立即使用资金"],
+        ["储蓄余额", m["savings"], "储蓄账户余额"],
+        ["应收贷款本金", m["receivables"], "未收回本金"],
+        ["负债余额", m["liabilities"], "未偿还借入资金"],
+        ["今日可安全花", m["safe_to_spend"], "现金安全线和预算约束后的可用额"],
+        ["信用分", score_text(m["credit_score"]), "家庭内部风控评分"],
+        ["本月收入", m["month_income"], month_str()],
+        ["本月消费", m["month_expense"], month_str()],
+        ["待审批数量", len([r for r in data.get("pending_requests", []) if r.get("parent_status") == "待审批"]), "pending_requests"],
+        ["开放赏金任务", len([b for b in data.get("bounties", []) if b.get("status") == "开放"]), "bounties"],
+    ]
+    add("summary", ["指标", "数值", "说明"], summary_rows, min_rows=40)
+
     tx_rows = [[tx.get("date", ""), tx.get("type", ""), tx.get("amount", 0), tx.get("category", ""), tx.get("party", ""), tx.get("memo", ""), tx.get("created_by", ""), tx.get("loan_id", ""), tx.get("bounty_id", ""), tx.get("id", "")] for tx in sorted(data.get("transactions", []), key=lambda x: str(x.get("date", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "transactions", rows=max(100, len(tx_rows) + 5), cols=10), ["日期", "类型", "金额", "分类", "对象/商户", "备注", "创建人", "贷款ID", "赏金ID", "交易ID"], tx_rows)
+    add("transactions", ["日期", "类型", "金额", "分类", "对象/商户", "备注", "创建人", "贷款ID", "赏金ID", "交易ID"], tx_rows, min_rows=300)
+
     budget_rows = [[cat, row["limit"], row["spent"], row["remaining"], row["ratio"]] for cat, row in m["budget_usage"].items()]
-    set_table(get_or_create_ws(sh, "budgets"), ["分类", "预算", "已花", "剩余", "使用率"], budget_rows)
-    goal_rows = [[g["name"], g["category"], g["target"], g["current"], g["remaining"], g["progress"], g.get("deadline", ""), g.get("days_left", "")] for g in m["goals"]]
-    set_table(get_or_create_ws(sh, "goals"), ["目标", "分类", "目标金额", "当前金额", "剩余金额", "完成度", "截止日", "剩余天数"], goal_rows)
+    add("budgets", ["分类", "预算", "已花", "剩余", "使用率"], budget_rows, min_rows=80)
+
     pending_rows = [[r.get("created_at", ""), r.get("applicant", ""), r.get("request_type", ""), r.get("amount", 0), r.get("category", ""), r.get("python_decision", ""), r.get("parent_status", ""), r.get("final_status", ""), r.get("approved_by", ""), r.get("request_text", ""), r.get("parent_note", "")] for r in sorted(data.get("pending_requests", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "pending_requests", rows=max(100, len(pending_rows) + 5), cols=11), ["申请时间", "申请人", "类型", "金额", "分类", "系统结论", "家长状态", "最终状态", "审批人", "原始申请", "家长备注"], pending_rows)
+    add("pending_requests", ["申请时间", "申请人", "类型", "金额", "分类", "系统结论", "家长状态", "最终状态", "审批人", "原始申请", "家长备注"], pending_rows, min_rows=200)
+
     bounty_rows = [[b.get("title", ""), b.get("status", ""), b.get("reward_amount", 0), b.get("reward_points", 0), b.get("difficulty", ""), b.get("deadline", ""), b.get("created_by", ""), b.get("assigned_to", ""), b.get("submission_note", ""), b.get("reviewed_by", ""), b.get("parent_note", "")] for b in sorted(data.get("bounties", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "bounties", rows=max(100, len(bounty_rows) + 5), cols=11), ["任务", "状态", "赏金", "积分", "难度", "截止日", "发布人", "领取人", "提交说明", "审核人", "家长备注"], bounty_rows)
+    add("bounties", ["任务", "状态", "赏金", "积分", "难度", "截止日", "发布人", "领取人", "提交说明", "审核人", "家长备注"], bounty_rows, min_rows=200)
+
     loan_rows = [[l.get("loan_id"), l.get("date"), l.get("borrower"), l.get("principal"), l.get("repaid"), l.get("remaining"), l.get("expected_repayment"), l.get("expected_interest"), l.get("interest_received"), l.get("due_date"), l.get("status"), l.get("memo")] for l in m["loans"]]
-    set_table(get_or_create_ws(sh, "loan_book"), ["贷款ID", "日期", "借款人", "本金", "已还本金", "剩余本金", "预计回款", "预计利息", "已收利息", "到期日", "状态", "备注"], loan_rows)
+    add("loan_book", ["贷款ID", "日期", "借款人", "本金", "已还本金", "剩余本金", "预计回款", "预计利息", "已收利息", "到期日", "状态", "备注"], loan_rows, min_rows=120)
+
+    if scope != "full":
+        return tables
+
+    goal_rows = [[g["name"], g["category"], g["target"], g["current"], g["remaining"], g["progress"], g.get("deadline", ""), g.get("days_left", ""), g.get("status", "进行中")] for g in m["goals"]]
+    add("goals", ["目标", "分类", "目标金额", "当前金额", "剩余金额", "完成度", "截止日", "剩余天数", "状态"], goal_rows, min_rows=120)
+
     score_rows = [[h.get("time", ""), h.get("score", ""), h.get("change", ""), h.get("event", ""), h.get("reason", "")] for h in sorted(data.get("score_history", []), key=lambda x: str(x.get("time", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "score_history"), ["时间", "信用分", "变化", "事件", "原因"], score_rows)
+    add("score_history", ["时间", "信用分", "变化", "事件", "原因"], score_rows, min_rows=300)
+
     merchant_rows = []
     for mer in data.get("merchants", []):
         res = evaluate_merchant_access(data, mer)
         merchant_rows.append([mer.get("name", ""), mer.get("category", ""), mer.get("discount", 0), mer.get("required_score", 0), mer.get("category_budget_cap", 1.0), res.get("result", ""), "；".join(res.get("failed", [])), mer.get("note", "")])
-    set_table(get_or_create_ws(sh, "merchants"), ["商户", "分类", "折扣", "最低信用分", "品类预算上限", "状态", "失败原因", "说明"], merchant_rows)
+    add("merchants", ["商户", "分类", "折扣", "最低信用分", "品类预算上限", "状态", "失败原因", "说明"], merchant_rows, min_rows=120)
 
-    setting_rows = [[k, v] for k, v in data.get("settings", {}).items()]
-    set_table(get_or_create_ws(sh, "settings"), ["设置项", "值"], setting_rows)
-
-    rule_rows = [[k, v] for k, v in data.get("rules", {}).items()]
-    set_table(get_or_create_ws(sh, "rules"), ["规则", "当前值"], rule_rows)
+    add("settings", ["设置项", "值"], [[k, v] for k, v in data.get("settings", {}).items()], min_rows=80)
+    add("rules", ["规则", "当前值"], [[k, v] for k, v in data.get("rules", {}).items()], min_rows=80)
 
     report_rows = []
     for w in sorted(data.get("weekly_reports", []), key=lambda x: str(x.get("week_start", "")), reverse=True):
         wm = w.get("metrics", {}) or {}
         report_rows.append([w.get("week_start", ""), w.get("generated_at", ""), wm.get("income", ""), wm.get("expense", ""), wm.get("savings", ""), wm.get("score", ""), wm.get("top_category", ""), w.get("content", "")])
-    set_table(get_or_create_ws(sh, "weekly_report"), ["周起始日", "生成时间", "收入", "消费", "储蓄", "信用分", "最大消费分类", "周报内容"], report_rows)
+    add("weekly_report", ["周起始日", "生成时间", "收入", "消费", "储蓄", "信用分", "最大消费分类", "周报内容"], report_rows, min_rows=120)
 
-    backup_rows = [[b.get("id", ""), b.get("time", ""), b.get("operator", ""), b.get("event", ""), b.get("reason", "")] for b in sorted(data.get("backups", []), key=lambda x: str(x.get("time", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "backups"), ["备份ID", "时间", "操作人", "事件", "原因"], backup_rows)
+    add("backups", ["备份ID", "时间", "操作人", "事件", "原因"], [[b.get("id", ""), b.get("time", ""), b.get("operator", ""), b.get("event", ""), b.get("reason", "")] for b in sorted(data.get("backups", []), key=lambda x: str(x.get("time", "")), reverse=True)], min_rows=120)
+    add("badges", ["徽章", "获得时间", "说明"], [[b.get("name", ""), b.get("earned_at", ""), b.get("description", "")] for b in sorted(data.get("badges", []), key=lambda x: str(x.get("earned_at", "")), reverse=True)], min_rows=120)
+    add("rewards", ["奖励", "创建时间", "创建人", "状态", "说明"], [[r.get("title", ""), r.get("created_at", ""), r.get("created_by", ""), r.get("status", ""), r.get("note", "")] for r in sorted(data.get("rewards", []), key=lambda x: str(x.get("created_at", "")), reverse=True)], min_rows=120)
+    add("audit_log", ["时间", "操作人", "事件", "详情"], [[a.get("time", ""), a.get("operator", ""), a.get("event", ""), a.get("detail", "")] for a in sorted(data.get("audit_log", []), key=lambda x: str(x.get("time", "")), reverse=True)], min_rows=300)
+    return tables
 
-    badge_rows = [[b.get("name", ""), b.get("earned_at", ""), b.get("description", "")] for b in sorted(data.get("badges", []), key=lambda x: str(x.get("earned_at", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "badges"), ["徽章", "获得时间", "说明"], badge_rows)
 
-    reward_rows = [[r.get("title", ""), r.get("created_at", ""), r.get("created_by", ""), r.get("status", ""), r.get("note", "")] for r in sorted(data.get("rewards", []), key=lambda x: str(x.get("created_at", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "rewards"), ["奖励", "创建时间", "创建人", "状态", "说明"], reward_rows)
+def sync_readable_sheets(data: Dict[str, Any], scope: str = "core") -> Dict[str, Any]:
+    """低配额 Google Sheet 展示页刷新。
 
-    audit_rows = [[a.get("time", ""), a.get("operator", ""), a.get("event", ""), a.get("detail", "")] for a in sorted(data.get("audit_log", []), key=lambda x: str(x.get("time", "")), reverse=True)]
-    set_table(get_or_create_ws(sh, "audit_log"), ["时间", "操作人", "事件", "详情"], audit_rows)
+    以前逐表执行 clear + update，十几张表会产生几十个 write requests，容易触发 429。
+    现在用 batch_clear + values_batch_update：已有工作表情况下，一次刷新通常只消耗约 2 个写请求。
+    """
+    if not gsheet_enabled():
+        raise RuntimeError("Google Sheet 未配置。")
+    scope = "full" if scope == "full" else "core"
+    data = normalize_data(data)
+    sh = get_spreadsheet()
+    tables = _build_sheet_tables(data, scope=scope)
 
+    existing_titles = {ws.title for ws in sh.worksheets()}
+    for title, table in tables.items():
+        if title not in existing_titles:
+            # 新建 worksheet 会消耗写请求。首次初始化如果仍遇到 429，等一分钟后重试即可。
+            sh.add_worksheet(title=title, rows=max(table["min_rows"], len(table["rows"]) + 10), cols=max(table["cols"], 2))
+
+    clear_ranges: List[str] = []
+    updates: List[Dict[str, Any]] = []
+    for title, table in tables.items():
+        header = table["header"]
+        rows = table["rows"]
+        cols = table["cols"]
+        row_count = max(table["min_rows"], len(rows) + 1)
+        values = [header] + rows
+        clear_ranges.append(_sheet_a1_range(title, row_count, cols))
+        updates.append({
+            "range": _sheet_a1_range(title, len(values), cols),
+            "values": _pad_sheet_values(values, len(values), cols),
+        })
+
+    # 两个批量请求，替代原来的几十个逐表请求。
+    if clear_ranges:
+        sh.batch_clear(clear_ranges)
+    if updates:
+        sh.values_batch_update({"valueInputOption": "RAW", "data": updates})
+
+    return {"scope": scope, "sheet_count": len(tables), "updated_at": now_str()}
 
 def build_excel_export(data: Dict[str, Any]) -> Optional[bytes]:
     if openpyxl is None:
@@ -1890,8 +1972,11 @@ def page_settings(data: Dict[str, Any]) -> None:
             if st.button("重新从存储读取"):
                 reload_data(); st.rerun()
         with c2:
-            if st.button("手动刷新 Google Sheet 展示页", disabled=not can_parent()):
-                try: sync_readable_sheets(data); st.success("展示页已刷新。")
+            if st.button("刷新核心展示页", disabled=not can_parent()):
+                try: result = sync_readable_sheets(data, scope="core"); st.success(f"核心展示页已刷新：{result['sheet_count']} 张表。")
+                except Exception as e: st.error(f"刷新失败：{e}")
+            if st.button("完整刷新展示页（低频）", disabled=not can_parent(), help="会刷新更多 worksheet。若遇到 429，请等待 1 分钟后再试。"):
+                try: result = sync_readable_sheets(data, scope="full"); st.success(f"完整展示页已刷新：{result['sheet_count']} 张表。")
                 except Exception as e: st.error(f"刷新失败：{e}")
         with c3:
             confirm = st.checkbox("确认清空所有数据")
@@ -2581,10 +2666,16 @@ def page_google_sheet_full(data: Dict[str, Any]) -> None:
     c1, c2, c3 = st.columns(3)
     if c1.button("重新从 Google Sheet / 本地读取", key="full_reload_storage"):
         reload_data(); st.rerun()
-    if c2.button("手动刷新 Google Sheet 展示页", key="full_sync_sheets", disabled=not can_parent()):
+    if c2.button("刷新核心展示页", key="full_sync_sheets", disabled=not can_parent()):
         try:
-            sync_readable_sheets(data)
-            st.success("展示页已刷新。")
+            result = sync_readable_sheets(data, scope="core")
+            st.success(f"核心展示页已刷新：{result['sheet_count']} 张表。")
+        except Exception as e:
+            st.error(f"刷新失败：{e}")
+    if c2.button("完整刷新展示页（低频）", key="full_sync_sheets_all", disabled=not can_parent(), help="会刷新更多 worksheet。若遇到 429，请等待 1 分钟后再试。"):
+        try:
+            result = sync_readable_sheets(data, scope="full")
+            st.success(f"完整展示页已刷新：{result['sheet_count']} 张表。")
         except Exception as e:
             st.error(f"刷新失败：{e}")
     if c3.button("保存当前主数据到存储", key="full_force_save", disabled=not can_parent()):
