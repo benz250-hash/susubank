@@ -1,0 +1,1 @@
+web: streamlit run asu_money2.py --server.port $PORT --server.address 0.0.0.0
